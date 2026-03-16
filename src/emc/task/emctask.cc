@@ -705,6 +705,18 @@ int emcTaskUpdate(EMC_TASK_STAT * stat)
 
     char buf[LINELEN];
     rtapi_strxcpy(stat->file, interp.file(buf, LINELEN));
+
+    // populate call stack for UI: frame 0 = main, frame[callLevel] = current
+    {
+        int lvl = stat->callLevel;
+        if (lvl < 0) lvl = 0;
+        if (lvl >= EMC_MAX_CALL_STACK) lvl = EMC_MAX_CALL_STACK - 1;
+        for (int i = 0; i <= lvl && i < EMC_MAX_CALL_STACK; i++) {
+            rtapi_strxcpy(stat->callStack[i].filename, interp.call_frame_filename(i));
+            rtapi_strxcpy(stat->callStack[i].subname,  interp.call_frame_subname(i));
+            stat->callStack[i].line = interp.call_frame_line(i);
+        }
+    }
     // command set in main
 
     // update active G and M codes

@@ -122,6 +122,7 @@ EMC_TASK_STAT::EMC_TASK_STAT()
     execState(EMC_TASK_EXEC::DONE),
     interpState(EMC_TASK_INTERP::IDLE),
     callLevel(0),
+    callStack{},
     motionLine(0),
     currentLine(0),
     readLine(0),

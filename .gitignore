@@ -1,5 +1,6 @@
 autosave.halscope
 build-stamp
+*/emc/.idea/*
 *.pyc
 *.o
 *.ko
@@ -12,8 +13,11 @@ build-stamp
 *.cmd
 .tmp*
 src/*.mod
-# Ignore generated html files, 
+# Ignore generated html files,
 /docs/src/*/*.html
+# Ignore generated man pages
+/docs/man/man3/
+/docs/man/man9/
 # docs/html/.gitignore is for the html directory
 debian/*.debhelper.log
 rtlib/Module.symvers

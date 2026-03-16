@@ -53,6 +53,9 @@ public:
     virtual int reset() = 0;
     virtual int line() = 0;
     virtual int call_level() = 0;
+    virtual const char *call_frame_filename(int level) = 0;
+    virtual const char *call_frame_subname(int level) = 0;
+    virtual int         call_frame_line(int level) = 0;
     virtual char *command(char *buf, size_t buflen) = 0;
     virtual char *file(char *buf, size_t buflen) = 0;
     virtual int on_abort(int reason, const char *message) = 0;

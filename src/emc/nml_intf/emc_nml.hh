@@ -1432,6 +1432,13 @@ class EMC_TASK_STAT_MSG:public RCS_STAT_MSG {
     uint64_t taskbeat;  // milltask's main loop heartbeat counter
 };
 
+#define EMC_MAX_CALL_STACK 10
+struct EmcCallFrame {
+    char filename[LINELEN]; // file being executed at this level
+    char subname[256];      // O-word subroutine name at this level (empty for main)
+    int  line;              // line number in that file
+};
+
 class EMC_TASK_STAT:public EMC_TASK_STAT_MSG {
   public:
     EMC_TASK_STAT();
@@ -1447,6 +1454,7 @@ class EMC_TASK_STAT:public EMC_TASK_STAT_MSG {
     EMC_TASK_EXEC execState;	// EMC_DONE,WAITING_FOR_MOTION, etc.
     EMC_TASK_INTERP interpState;	// EMC_IDLE,READING,PAUSED,WAITING
     int callLevel;              // current subroutine level - 0 if not in a subroutine, > 0 otherwise
+    EmcCallFrame callStack[EMC_MAX_CALL_STACK]; // [0]=main, [callLevel]=currently executing
     int motionLine;		// line motion is executing-- may lag
     int currentLine;		// line currently executing
     int readLine;		// line interpreter has read to

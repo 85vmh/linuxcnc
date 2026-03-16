@@ -88,6 +88,9 @@ public:
     int reset() override;
     int line() override;
     int call_level() override;
+    const char *call_frame_filename(int) override { return ""; }
+    const char *call_frame_subname(int) override  { return ""; }
+    int         call_frame_line(int) override      { return 0; }
     char *command(char *buf, size_t buflen) override;
     char *file(char *buf, size_t buflen) override;
     int on_abort(int reason, const char *message) override;

@@ -479,6 +479,23 @@ int Interp::set_probe_data(setup_pointer settings)       //!< pointer to machine
 
 int Interp::call_level(void) { return _setup.call_level; }
 
+const char *Interp::call_frame_filename(int level) {
+    if (level < 0 || level >= INTERP_SUB_ROUTINE_LEVELS) return "";
+    const char *f = _setup.sub_context[level].filename;
+    return f ? f : "";
+}
+
+const char *Interp::call_frame_subname(int level) {
+    if (level < 0 || level >= INTERP_SUB_ROUTINE_LEVELS) return "";
+    const char *s = _setup.sub_context[level].subName;
+    return s ? s : "";
+}
+
+int Interp::call_frame_line(int level) {
+    if (level < 0 || level >= INTERP_SUB_ROUTINE_LEVELS) return 0;
+    return _setup.sub_context[level].sequence_number;
+}
+
 std::string toString(GCodes g)
 {
     char buf[15]={};

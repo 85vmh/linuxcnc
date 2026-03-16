@@ -804,6 +804,23 @@ static PyObject *Stat_tool_table(pyStatChannel * /*s*/, void *) {
     return res;
 }
 
+static PyObject *Stat_call_stack(pyStatChannel *s, void *) {
+    int lvl = s->status.task.callLevel;
+    if (lvl < 0) lvl = 0;
+    if (lvl >= EMC_MAX_CALL_STACK) lvl = EMC_MAX_CALL_STACK - 1;
+    // return a tuple of dicts, one per active frame (0..callLevel inclusive)
+    PyObject *res = PyTuple_New(lvl + 1);
+    for (int i = 0; i <= lvl; i++) {
+        const EmcCallFrame &f = s->status.task.callStack[i];
+        PyObject *d = PyDict_New();
+        PyDict_SetItemString(d, "filename", PyUnicode_FromString(f.filename));
+        PyDict_SetItemString(d, "subname",  PyUnicode_FromString(f.subname));
+        PyDict_SetItemString(d, "line",     PyLong_FromLong(f.line));
+        PyTuple_SET_ITEM(res, i, d);
+    }
+    return res;
+}
+
 static PyObject *Stat_heartbeat(pyStatChannel *s, void *) {
 #if PY_VERSION_HEX >= 0x030e00f0  // 3.14
     return PyLong_FromUInt64(s->status.motion.heartbeat);
@@ -852,6 +869,11 @@ static PyGetSetDef Stat_getsetlist[] = {
     {(char*)"tool_table", (getter)Stat_tool_table, (setter)NULL,
         (char*)"The tooltable, expressed as a list of tools.  Each tool is a dict with the\n"
         "tool id (tool number), diameter, offsets, etc.", NULL
+    },
+    {(char*)"call_stack", (getter)Stat_call_stack, NULL,
+        (char*)"Interpreter subroutine call stack. A tuple of dicts (one per active frame, "
+               "index 0 = main program, index call_level = currently executing). "
+               "Each dict has 'filename', 'subname', and 'line' keys.", NULL
     },
     {(char*)"heartbeat", (getter)Stat_heartbeat, NULL,
         (char*)"Motion controller heartbeat counter. Increments every servo cycle.", NULL

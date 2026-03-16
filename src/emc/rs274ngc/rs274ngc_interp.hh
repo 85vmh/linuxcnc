@@ -125,6 +125,9 @@ public:
 
  int line() override { return sequence_number(); }
  int call_level() override;
+ const char *call_frame_filename(int level) override;
+ const char *call_frame_subname(int level) override;
+ int         call_frame_line(int level) override;
 
  char *command(char *buf, size_t len) override { line_text(buf, len); return buf; }
 
