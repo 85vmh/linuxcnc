@@ -3452,13 +3452,20 @@ STATIC tp_err_t tpCheckAtSpeed(TP_STRUCT * const tp, TC_STRUCT * const tc)
             emcmotStatus->spindleSync = 1;
             tp->spindle.waiting_for_index = MOTION_INVALID_ID;
             tp->spindle.revs = 0;
-            tp->spindle.offset = tp->spindle.pending_offset;
+            /* spindle_pos is absolute (spindleRevs since HAL start), so offset
+             * must also be absolute: current_pos + relative_angle_offset.
+             * This makes pos_desired = (spindle_pos - offset) * pitch negative
+             * until the spindle advances by pending_offset revolutions past index. */
+            double spindle_pos_at_index = tpGetSignedSpindlePosition(
+                    &emcmotStatus->spindle_status[tp->spindle.spindle_num]);
+            tp->spindle.offset = spindle_pos_at_index + tp->spindle.pending_offset;
             if (tp->spindle.pending_offset == 0.0) {
                 /* no angle offset: use sync_accel to ramp up to spindle speed */
                 tc->sync_accel = 1;
             }
             /* if pending_offset > 0: tpSyncPositionMode() holds Z until
-             * spindle.revs reaches pending_offset, then starts moving normally */
+             * spindle reaches (spindle_pos_at_index + pending_offset),
+             * i.e., pending_offset revolutions past index */
         }
     }
     return TP_ERR_OK;
