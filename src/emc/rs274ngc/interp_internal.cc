@@ -486,8 +486,12 @@ const char *Interp::call_frame_filename(int level) {
 }
 
 const char *Interp::call_frame_subname(int level) {
-    if (level < 0 || level >= INTERP_SUB_ROUTINE_LEVELS) return "";
-    const char *s = _setup.sub_context[level].subName;
+    // Frame[i] records "at line L of file F we called subroutine S".
+    // sub_context[i].filename/sequence_number = caller info (return address).
+    // sub_context[i+1].subName = the subroutine that was called.
+    int sub_level = level + 1;
+    if (sub_level < 0 || sub_level >= INTERP_SUB_ROUTINE_LEVELS) return "";
+    const char *s = _setup.sub_context[sub_level].subName;
     return s ? s : "";
 }
 

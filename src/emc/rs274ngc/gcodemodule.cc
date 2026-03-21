@@ -585,6 +585,7 @@ void CANON_ERROR(const char * /*fmt*/, ...) {};
 void CLAMP_AXIS(CANON_AXIS /*axis*/) {}
 bool GET_OPTIONAL_PROGRAM_STOP() { return false;}
 void SET_OPTIONAL_PROGRAM_STOP(bool /*state*/) {}
+void SET_CALL_LEVEL(int /*level*/) {}
 void SPINDLE_RETRACT_TRAVERSE() {}
 void SPINDLE_RETRACT() {}
 void STOP_CUTTER_RADIUS_COMPENSATION() {}

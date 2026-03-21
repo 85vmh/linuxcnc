@@ -706,12 +706,36 @@ int emcTaskUpdate(EMC_TASK_STAT * stat)
     char buf[LINELEN];
     rtapi_strxcpy(stat->file, interp.file(buf, LINELEN));
 
-    // populate call stack for UI: frame 0 = main, frame[callLevel] = current
+    // Update callLevel from the currently-executing motion's StateTag.
+    // STRAIGHT_FEED uses a segment buffer (see_segment/flush_segments), so motion
+    // commands are only appended to interp_list in batches.  All commands may be
+    // dequeued before motion starts, making the interp_list dequeue-time value
+    // unreliable.  Reading from motion.traj.tag gives the level of the move the
+    // motion controller is currently executing.
+    // The call level is stored in bits 24-30 of packed_flags by emccanon.cc.
+    if (stat->interpState == EMC_TASK_INTERP::IDLE) {
+        // Interpreter is idle (program done or aborted): no subroutine is active.
+        stat->callLevel = 0;
+    } else {
+        int tag_level = (int)((emcStatus->motion.traj.tag.packed_flags >> 24) & 0x7F);
+        // Only update callLevel from the tag when motion is actually running;
+        // otherwise keep whatever was set at interp_list dequeue time.
+        if (emcStatus->motion.traj.id > 0) {
+            stat->callLevel = tag_level;
+        }
+    }
+
+    // populate call stack for UI.
+    // callStack has callLevel entries (one per active call frame).
+    // Frame[i] = "at line L of file F we called subroutine S":
+    //   filename/line come from sub_context[i] (the return address saved when entering level i+1)
+    //   subname    comes from sub_context[i+1] (the name of the subroutine at level i+1)
+    // At callLevel=0 (main program) the stack is empty.
     {
         int lvl = stat->callLevel;
         if (lvl < 0) lvl = 0;
-        if (lvl >= EMC_MAX_CALL_STACK) lvl = EMC_MAX_CALL_STACK - 1;
-        for (int i = 0; i <= lvl && i < EMC_MAX_CALL_STACK; i++) {
+        if (lvl > EMC_MAX_CALL_STACK) lvl = EMC_MAX_CALL_STACK;
+        for (int i = 0; i < lvl; i++) {
             rtapi_strxcpy(stat->callStack[i].filename, interp.call_frame_filename(i));
             rtapi_strxcpy(stat->callStack[i].subname,  interp.call_frame_subname(i));
             stat->callStack[i].line = interp.call_frame_line(i);

@@ -680,6 +680,8 @@ int Interp::enter_context(setup_pointer settings, block_pointer block)
     frame->pystuff.impl->py_return_type = -1;
     // distinguish call frames: oword,m99,python,remap
     frame->call_type = block->call_type;
+    // notify canon layer so subsequent interp_list entries carry the new depth
+    SET_CALL_LEVEL(settings->call_level);
     return INTERP_OK;
 }
 
@@ -698,6 +700,9 @@ int Interp::leave_context(setup_pointer settings, bool restore)
     free_named_parameters(leaving_frame);
     leaving_frame->subName = NULL;
     settings->call_level--;  // drop back
+
+    // notify canon layer so subsequent interp_list entries carry the restored depth
+    SET_CALL_LEVEL(settings->call_level);
 
     if (restore && ((leaving_frame->context_status &
 		     (CONTEXT_RESTORE_ON_RETURN|CONTEXT_VALID)) ==

@@ -807,10 +807,11 @@ static PyObject *Stat_tool_table(pyStatChannel * /*s*/, void *) {
 static PyObject *Stat_call_stack(pyStatChannel *s, void *) {
     int lvl = s->status.task.callLevel;
     if (lvl < 0) lvl = 0;
-    if (lvl >= EMC_MAX_CALL_STACK) lvl = EMC_MAX_CALL_STACK - 1;
-    // return a tuple of dicts, one per active frame (0..callLevel inclusive)
-    PyObject *res = PyTuple_New(lvl + 1);
-    for (int i = 0; i <= lvl; i++) {
+    if (lvl > EMC_MAX_CALL_STACK) lvl = EMC_MAX_CALL_STACK;
+    // return a tuple of dicts with callLevel entries (empty when in main program).
+    // frame[i] = "at line L of filename F we called subroutine S"
+    PyObject *res = PyTuple_New(lvl);
+    for (int i = 0; i < lvl; i++) {
         const EmcCallFrame &f = s->status.task.callStack[i];
         PyObject *d = PyDict_New();
         PyDict_SetItemString(d, "filename", PyUnicode_FromString(f.filename));

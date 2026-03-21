@@ -928,6 +928,11 @@ extern void GET_EXTERNAL_PARAMETER_FILE_NAME(char *filename, int max_size);
 
 extern void SET_PARAMETER_FILE_NAME(const char *name);
 
+// Notifies the canon layer of the current interpreter subroutine call depth.
+// Called at enter_context (after call_level++) and leave_context (after call_level--).
+// This allows commands enqueued in interp_list to carry the correct call depth.
+extern void SET_CALL_LEVEL(int level);
+
 // returns the currently active plane
 extern CANON_PLANE GET_EXTERNAL_PLANE();
 

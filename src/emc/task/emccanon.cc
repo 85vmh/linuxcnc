@@ -156,8 +156,28 @@ static void flush_segments(void);
  * Note that the append function takes the message by reference, so this also
  * needs to have the message passed in by reference or it barfs.
  */
+// Current interpreter subroutine call depth, updated by SET_CALL_LEVEL.
+// Embedded into each motion command's StateTag packed_flags (bits 24-30)
+// so the executing call level can be read back from emcStatus->motion.traj.tag.
+static int canon_call_level = 0;
+
+// Bit range in StateTag.packed_flags used to carry the call level.
+// Bits 0-23 are reserved for GM_FLAG_* values (GM_FLAG_MAX_FLAGS == 24).
+#define CALL_LEVEL_SHIFT 24
+#define CALL_LEVEL_MASK  0x7FUL   // 7 bits, supports levels 0-127
+
 static inline void tag_and_send(std::unique_ptr<EMC_TRAJ_CMD_MSG> &&msg, StateTag const &tag) {
     msg->tag = tag;
+    // Embed the current call level in unused bits 24-30.
+    // Must update msg->tag.flags (the bitset), NOT just packed_flags, because
+    // emcTrajUpdateTag() calls get_state_tag() which rebuilds packed_flags from
+    // flags.to_ulong() — any changes to packed_flags alone are lost.
+    for (int i = 0; i < 7; i++) {
+        if ((canon_call_level >> i) & 1)
+            msg->tag.flags.set(CALL_LEVEL_SHIFT + i);
+        else
+            msg->tag.flags.reset(CALL_LEVEL_SHIFT + i);
+    }
     interp_list.append(std::move(msg));
 }
 
@@ -3883,6 +3903,15 @@ static char _parameter_file_name[LINELEN];
 void SET_PARAMETER_FILE_NAME(const char *name)
 {
   strncpy(_parameter_file_name, name, PARAMETER_FILE_NAME_LENGTH);
+}
+
+void SET_CALL_LEVEL(int level)
+{
+    // Flush any buffered motion segments before changing the call level so that
+    // segments accumulated at the current level are sent with the correct level.
+    flush_segments();
+    canon_call_level = level;
+    interp_list.set_call_level(level);
 }
 
 void GET_EXTERNAL_PARAMETER_FILE_NAME(char *file_name,	/* string: to copy

@@ -683,6 +683,8 @@ void UNCLAMP_AXIS(CANON_AXIS axis)
 void PROGRAM_STOP()
 {PRINT("PROGRAM_STOP()\n");}
 
+void SET_CALL_LEVEL(int /*level*/) {} // no-op: SAI doesn't need to track call depth in interp_list
+
 void SET_BLOCK_DELETE(bool state)
 {_sai.block_delete = state;} //state == ON, means we don't interpret lines starting with "/"
 

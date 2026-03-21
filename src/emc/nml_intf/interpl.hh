@@ -26,6 +26,7 @@ class NMLmsg;
 struct NML_INTERP_LIST_NODE
 {
     int line_number;  // line number it was on
+    int call_level;   // interpreter subroutine call depth when this was enqueued
     // std::vector<char> command;
     std::unique_ptr<NMLmsg> command;
 };
@@ -36,6 +37,8 @@ class NML_INTERP_LIST
 public:
     void set_line_number(int line);
     int get_line_number();
+    void set_call_level(int level);
+    int get_call_level();
     int append(std::unique_ptr<NMLmsg>&& command);
     std::unique_ptr<NMLmsg> get();
     void clear();
@@ -46,6 +49,8 @@ private:
     std::deque<NML_INTERP_LIST_NODE> linked_list;
     int next_line_number = 0;  // line number used to fill temp_node
     int line_number = 0;       // line number of node from get()
+    int next_call_level = 0;   // call level used to fill temp_node
+    int call_level = 0;        // call level of node from get()
                                // NML_INTERP_LIST_NODE node; // pointer returned by get
 };
 
