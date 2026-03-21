@@ -3453,15 +3453,15 @@ STATIC tp_err_t tpCheckAtSpeed(TP_STRUCT * const tp, TC_STRUCT * const tc)
             tp->spindle.waiting_for_index = MOTION_INVALID_ID;
             tp->spindle.revs = 0;
             tp->spindle.offset = 0.0;
-            rtapi_print_msg(RTAPI_MSG_ERR, "Index: pending_offset=%.4f spindleRevs=%.4f\n",
-                    tp->spindle.pending_offset,
+            rtapi_print_msg(RTAPI_MSG_ERR, "Index: tc->angle_offset=%.4f spindleRevs=%.4f\n",
+                    tc->angle_offset,
                     emcmotStatus->spindle_status[tp->spindle.spindle_num].spindleRevs);
-            if (tp->spindle.pending_offset == 0.0) {
+            if (tc->angle_offset == 0.0) {
                 /* no angle offset: use sync_accel to ramp up to spindle speed */
                 tc->sync_accel = 1;
             }
-            /* if pending_offset > 0: tpSyncPositionMode() will hold Z at rest
-             * until the spindle reaches pending_offset revolutions past the
+            /* if angle_offset > 0: tpSyncPositionMode() will hold Z at rest
+             * until the spindle reaches angle_offset revolutions past the
              * index pulse, then release to tracking mode */
         }
     }
@@ -3612,15 +3612,15 @@ STATIC void tpSyncPositionMode(TP_STRUCT * const tp, TC_STRUCT * const tc,
     /* Angle-offset hold: after index, keep Z at rest until the spindle has
      * advanced pending_offset revolutions (spindleRevs resets to 0 at index).
      * When the target angle is reached, switch to normal tracking mode. */
-    if (tp->spindle.pending_offset > 0.0) {
-        if (tp->spindle.revs < tp->spindle.pending_offset) {
+    if (tc->angle_offset > 0.0) {
+        if (tp->spindle.revs < tc->angle_offset) {
             tc->target_vel = 0.0;
             return;
         }
         /* Spindle reached target angle: set offset so pos_desired = 0 now,
          * then fall through to normal tracking (sync_accel stays 0). */
         tp->spindle.offset = tp->spindle.revs;
-        tp->spindle.pending_offset = 0.0;
+        tc->angle_offset = 0.0;
     }
 
     double pos_desired = (tp->spindle.revs - tp->spindle.offset) * tc->uu_per_rev;
