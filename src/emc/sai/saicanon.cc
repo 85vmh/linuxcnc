@@ -736,7 +736,7 @@ int GET_EXTERNAL_AXIS_MASK() {return 0x3f;} // XYZABC machine
 double GET_EXTERNAL_ANGLE_UNITS() {return 1.0;}
 int GET_EXTERNAL_SELECTED_TOOL_SLOT() { return 0; }
 int GET_EXTERNAL_SPINDLE_OVERRIDE_ENABLE(int /*spindle*/) {return so_enable;}
-void START_SPEED_FEED_SYNCH(int /*spindle*/, double sync, bool vel)
+void START_SPEED_FEED_SYNCH(int /*spindle*/, double sync, bool vel, double /*angle_degrees*/)
 {PRINT("START_SPEED_FEED_SYNC(%f,%d)\n", sync, vel);}
 CANON_MOTION_MODE motion_mode;
 

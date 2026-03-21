@@ -83,6 +83,7 @@ typedef struct {
      double revs;
      int waiting_for_index;
      int waiting_for_atspeed;
+     double pending_offset; // requested angle offset in revolutions (set by tpSetSpindleSync, applied at index)
 } tp_spindle_t;
 
 /**

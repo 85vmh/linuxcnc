@@ -535,6 +535,7 @@ int tpInit(TP_STRUCT * const tp)
     tp->spindle.revs = 0.0;
     tp->spindle.waiting_for_index = MOTION_INVALID_ID;
     tp->spindle.waiting_for_atspeed = MOTION_INVALID_ID;
+    tp->spindle.pending_offset = 0.0;
 
     tp->reverse_run = TC_DIR_FORWARD;
     tp->termCond = TC_TERM_COND_PARABOLIC;
@@ -3450,8 +3451,14 @@ STATIC tp_err_t tpCheckAtSpeed(TP_STRUCT * const tp, TC_STRUCT * const tc)
             /* passed index, start the move */
             emcmotStatus->spindleSync = 1;
             tp->spindle.waiting_for_index = MOTION_INVALID_ID;
-            tc->sync_accel = 1;
             tp->spindle.revs = 0;
+            tp->spindle.offset = tp->spindle.pending_offset;
+            if (tp->spindle.pending_offset == 0.0) {
+                /* no angle offset: use sync_accel to ramp up to spindle speed */
+                tc->sync_accel = 1;
+            }
+            /* if pending_offset > 0: tpSyncPositionMode() holds Z until
+             * spindle.revs reaches pending_offset, then starts moving normally */
         }
     }
     return TP_ERR_OK;
@@ -4201,7 +4208,7 @@ int tpRunCycle(TP_STRUCT * const tp, long period)
     return TP_ERR_OK;
 }
 
-int tpSetSpindleSync(TP_STRUCT * const tp, int spindle, double sync, int mode) {
+int tpSetSpindleSync(TP_STRUCT * const tp, int spindle, double sync, int mode, double angular_offset_degrees) {
     if(sync) {
         if (mode) {
             tp->synchronized = TC_SYNC_VELOCITY;
@@ -4210,8 +4217,11 @@ int tpSetSpindleSync(TP_STRUCT * const tp, int spindle, double sync, int mode) {
         }
         tp->uu_per_rev = sync;
         tp->spindle.spindle_num = spindle;
-    } else
+        tp->spindle.pending_offset = angular_offset_degrees / 360.0;
+    } else {
         tp->synchronized = 0;
+        tp->spindle.pending_offset = 0.0;
+    }
 
     return TP_ERR_OK;
 }
