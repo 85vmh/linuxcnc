@@ -3911,7 +3911,6 @@ void SET_CALL_LEVEL(int level)
     // segments accumulated at the current level are sent with the correct level.
     flush_segments();
     canon_call_level = level;
-    interp_list.set_call_level(level);
 }
 
 void GET_EXTERNAL_PARAMETER_FILE_NAME(char *file_name,	/* string: to copy

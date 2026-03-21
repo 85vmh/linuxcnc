@@ -2622,7 +2622,7 @@ static int emcTaskExecute(void)
 		if (0 != emcTaskCommand) {
 		    emcTaskEager = 1;
 		    emcStatus->task.currentLine = interp_list.get_line_number();
-		    emcStatus->task.callLevel = interp_list.get_call_level();
+		    emcStatus->task.callLevel = emcTaskPlanLevel();
 		    // and set it for all subsystems which use queued ids
 		    emcTrajSetMotionId(emcStatus->task.currentLine);
 		    if (emcStatus->motion.traj.queueFull) {

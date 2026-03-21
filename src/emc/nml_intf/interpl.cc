@@ -30,12 +30,6 @@ void NML_INTERP_LIST::set_line_number(int line)
     next_line_number = line;
 }
 
-// sets the call level used for subsequent appends
-void NML_INTERP_LIST::set_call_level(int level)
-{
-    next_call_level = level;
-}
-
 int NML_INTERP_LIST::append(std::unique_ptr<NMLmsg>&& nml_msg_ptr)
 {
     /* check for invalid data */
@@ -54,7 +48,7 @@ int NML_INTERP_LIST::append(std::unique_ptr<NMLmsg>&& nml_msg_ptr)
         return -1;
     }
 
-    NML_INTERP_LIST_NODE node {next_line_number, next_call_level, std::move(nml_msg_ptr)};
+    NML_INTERP_LIST_NODE node {next_line_number, std::move(nml_msg_ptr)};
 
     // stick it on the list
     linked_list.emplace_back(std::move(node));
@@ -83,9 +77,8 @@ std::unique_ptr<NMLmsg> NML_INTERP_LIST::get()
     auto node = std::move(linked_list.front());
     linked_list.pop_front();
 
-    // save line number and call level of this one, for use by get_line_number/get_call_level
+    // save line number of this one, for use by get_line_number
     line_number = node.line_number;
-    call_level  = node.call_level;
 
     if (emc_debug & EMC_DEBUG_INTERP_LIST) {
         rcs_print("NML_INTERP_LIST(%p)::get(): {size=%ld, type=%s}, list_size=%lu\n",
@@ -124,9 +117,4 @@ int NML_INTERP_LIST::len()
 int NML_INTERP_LIST::get_line_number()
 {
     return line_number;
-}
-
-int NML_INTERP_LIST::get_call_level()
-{
-    return call_level;
 }
