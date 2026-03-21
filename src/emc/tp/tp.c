@@ -3453,9 +3453,6 @@ STATIC tp_err_t tpCheckAtSpeed(TP_STRUCT * const tp, TC_STRUCT * const tc)
             tp->spindle.waiting_for_index = MOTION_INVALID_ID;
             tp->spindle.revs = 0;
             tp->spindle.offset = 0.0;
-            rtapi_print_msg(RTAPI_MSG_ERR, "Index: tc->angle_offset=%.4f spindleRevs=%.4f\n",
-                    tc->angle_offset,
-                    emcmotStatus->spindle_status[tp->spindle.spindle_num].spindleRevs);
             if (tc->angle_offset == 0.0) {
                 /* no angle offset: use sync_accel to ramp up to spindle speed */
                 tc->sync_accel = 1;
@@ -4227,8 +4224,6 @@ int tpRunCycle(TP_STRUCT * const tp, long period)
 }
 
 int tpSetSpindleSync(TP_STRUCT * const tp, int spindle, double sync, int mode, double angular_offset_degrees) {
-    rtapi_print_msg(RTAPI_MSG_ERR, "tpSetSpindleSync: sync=%.4f angle_deg=%.2f pending_offset=%.4f\n",
-            sync, angular_offset_degrees, angular_offset_degrees / 360.0);
     if(sync) {
         if (mode) {
             tp->synchronized = TC_SYNC_VELOCITY;
