@@ -3452,20 +3452,14 @@ STATIC tp_err_t tpCheckAtSpeed(TP_STRUCT * const tp, TC_STRUCT * const tc)
             emcmotStatus->spindleSync = 1;
             tp->spindle.waiting_for_index = MOTION_INVALID_ID;
             tp->spindle.revs = 0;
-            /* spindle_pos is absolute (spindleRevs since HAL start), so offset
-             * must also be absolute: current_pos + relative_angle_offset.
-             * This makes pos_desired = (spindle_pos - offset) * pitch negative
-             * until the spindle advances by pending_offset revolutions past index. */
-            double spindle_pos_at_index = tpGetSignedSpindlePosition(
-                    &emcmotStatus->spindle_status[tp->spindle.spindle_num]);
-            tp->spindle.offset = spindle_pos_at_index + tp->spindle.pending_offset;
+            tp->spindle.offset = 0.0;
             if (tp->spindle.pending_offset == 0.0) {
                 /* no angle offset: use sync_accel to ramp up to spindle speed */
                 tc->sync_accel = 1;
             }
-            /* if pending_offset > 0: tpSyncPositionMode() holds Z until
-             * spindle reaches (spindle_pos_at_index + pending_offset),
-             * i.e., pending_offset revolutions past index */
+            /* if pending_offset > 0: tpSyncPositionMode() will hold Z at rest
+             * until the spindle reaches pending_offset revolutions past the
+             * index pulse, then release to tracking mode */
         }
     }
     return TP_ERR_OK;
@@ -3610,6 +3604,20 @@ STATIC void tpSyncPositionMode(TP_STRUCT * const tp, TC_STRUCT * const tc,
                 spindle_pos;
     } else {
         tp->spindle.revs = spindle_pos;
+    }
+
+    /* Angle-offset hold: after index, keep Z at rest until the spindle has
+     * advanced pending_offset revolutions (spindleRevs resets to 0 at index).
+     * When the target angle is reached, switch to normal tracking mode. */
+    if (tp->spindle.pending_offset > 0.0) {
+        if (tp->spindle.revs < tp->spindle.pending_offset) {
+            tc->target_vel = 0.0;
+            return;
+        }
+        /* Spindle reached target angle: set offset so pos_desired = 0 now,
+         * then fall through to normal tracking (sync_accel stays 0). */
+        tp->spindle.offset = tp->spindle.revs;
+        tp->spindle.pending_offset = 0.0;
     }
 
     double pos_desired = (tp->spindle.revs - tp->spindle.offset) * tc->uu_per_rev;
