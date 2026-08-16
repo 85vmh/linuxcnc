@@ -366,6 +366,12 @@ int Task::emcIoAbort(EMC_ABORT /*reason*/)//EMC_TOOL_ABORT_TYPE
     iocontrol_data.coolant_flood = 0;                /* coolant flood output pin */
     iocontrol_data.tool_change = 0;                /* abort tool change if in progress */
     iocontrol_data.tool_prepare = 0;                /* abort tool prepare if in progress */
+    // iocontrol used to reset status to DONE on every incoming NML command;
+    // without this the pending EXEC from an interrupted TOOL_PREPARE/TOOL_LOAD
+    // can never be cleared, since the handshake pins it waits on were just
+    // dropped above and read_tool_inputs() will never fire again.
+    emcioStatus.status = RCS_STATUS::DONE;
+    tool_status = 0;
     return 0;
 }
 

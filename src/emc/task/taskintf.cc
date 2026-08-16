@@ -1688,7 +1688,10 @@ int emcTrajUpdate(EMC_TRAJ_STAT * stat)
 
     if (emcmotStatus.motionFlag & EMCMOT_MOTION_ERROR_BIT) {
 	stat->status = RCS_STATUS::ERROR;
-    } else if (stat->inpos && (stat->queue == 0)) {
+    } else if ((stat->inpos || !stat->enabled) && (stat->queue == 0)) {
+	// motion clears the queue when it is disabled but never refreshes the
+	// INPOS flag (the DISABLED case in get_pos_cmds() does not touch it),
+	// so a machine disabled mid-move would report EXEC forever
 	stat->status = RCS_STATUS::DONE;
     } else {
 	stat->status = RCS_STATUS::EXEC;
