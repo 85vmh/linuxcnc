@@ -1,0 +1,27 @@
+# Wire up the logger and the test driver's own pins.  Runs after test-ui.py has
+# created its HAL component, and after LIB:sim_spindle_encoder.hal has created
+# the spindle signals.
+#
+# Channel order must match checkresult:
+#   0 spindle.0.revs        the sync reference
+#   1 Zpos                  Z position - the quantity under test
+#   2 Xpos                  X, to confirm nothing else moves
+#   3 spindle speed (rps)   so spindle speed changes are visible in the log
+#   4 motion.current-vel    path velocity
+#   5 motion.digital-out-00 marks the synchronized segment (M64/M65)
+#   6 test-ui.disturb       marks the cycle a disturbance was injected
+
+net spindle-pos          => sampler.0.pin.0
+net Zpos                 => sampler.0.pin.1
+net Xpos                 => sampler.0.pin.2
+net spindle-rps-filtered => sampler.0.pin.3
+
+net path-vel  motion.current-vel    => sampler.0.pin.4 test-ui.path-vel
+net sync-mark motion.digital-out-00 => sampler.0.pin.5 test-ui.sync-active
+net Xpos                            => test-ui.xpos
+net disturb   test-ui.disturb       => sampler.0.pin.6
+
+net sample-enable test-ui.sample-enable => sampler.0.enable
+
+# The adaptive-feed sweep drives this pin; the other sweeps leave it at 1.0.
+net adaptive-feed test-ui.adaptive-feed => motion.adaptive-feed

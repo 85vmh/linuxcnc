@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+#
+# Verifies that Z tracked the spindle for the whole of every threading pass.
+#
+# A thread is defined by one relationship: Z must advance exactly `pitch`
+# millimetres per spindle revolution.  Everything here measures the residual of
+# that relationship and asserts (a) that it stays small, and (b) that it does
+# not step when an override is changed mid-cut.
+
+import os
+import sys
+import glob
+
+PITCH = float(os.getenv("PITCH", "1.5"))
+SERVO_PERIOD = 0.001
+
+# Residual tolerance across a pass, in mm.  A thread is ruined well before this:
+# 20 um on a 1.5 mm pitch is a 1.3% pitch error.
+TOLERANCE = 0.020
+
+# A pass is measured from SKIP_REVS after it starts to END_REVS before it ends.
+# The lead-in is the planner ramping the axis up to spindle speed (sync_accel);
+# the lead-out is the segment reaching its programmed Z while the spindle keeps
+# turning.  Neither is a tracking failure, and on a real part both fall in the
+# thread relief.
+SKIP_REVS = 1.0
+END_REVS = 1.0
+
+# A pass must be at least this long to be worth measuring.
+MIN_REVS = 4.0
+
+# Window either side of a disturbance used to compare "before" against "after".
+WINDOW = 0.200
+
+# Anything slower than this counts as stopped (mm/s).
+MOVING_VEL = 0.1
+
+# Columns, matching postgui.hal.  Column 0 is halsampler's sample index.
+IDX, REVS, ZPOS, XPOS, SPEED, VEL, SYNC, DISTURB = 0, 1, 2, 3, 4, 5, 6, 7
+
+
+def load(path):
+    samples = []
+    with open(path) as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) < 8:
+                # halsampler prints a bare "overrun" marker on buffer overflow
+                continue
+            try:
+                samples.append([float(x) for x in parts])
+            except ValueError:
+                continue
+    return samples
+
+
+def threading_passes(samples):
+    """Contiguous runs that are a synchronized straight threading cut.
+
+    Inside the M64/M65 marked region, a threading pass is a run where the
+    machine is moving with X held still.  That excludes G76's traverses and its
+    angled infeed/taper moves, which all change X, so the same detector works
+    for a single G33 cut and for every pass of a G76 cycle.
+    """
+    passes = []
+    run = []
+    for i, s in enumerate(samples):
+        cutting = (s[SYNC] != 0
+                   and abs(s[VEL]) > MOVING_VEL
+                   and (not run or abs(s[XPOS] - samples[run[0]][XPOS]) < 1e-6))
+        if cutting:
+            run.append(i)
+        elif run:
+            passes.append(run)
+            run = []
+    if run:
+        passes.append(run)
+
+    return [r for r in passes
+            if abs(samples[r[-1]][REVS] - samples[r[0]][REVS]) >= MIN_REVS]
+
+
+def disturbances(samples, run):
+    """First sample index of each disturb pulse inside this run."""
+    points = []
+    prev = 0.0
+    for i in run:
+        if samples[i][DISTURB] != 0 and prev == 0:
+            points.append(i)
+        prev = samples[i][DISTURB]
+    return points
+
+
+def analyse_pass(name, n, samples, run):
+    start_revs = samples[run[0]][REVS]
+    end_revs = samples[run[-1]][REVS]
+    direction = 1.0 if end_revs > start_revs else -1.0
+
+    def past(i, revs):
+        return abs(samples[i][REVS] - start_revs) >= revs
+
+    def before_end(i, revs):
+        return abs(end_revs - samples[i][REVS]) >= revs
+
+    measured = [i for i in run if past(i, SKIP_REVS) and before_end(i, END_REVS)]
+    if len(measured) < 100:
+        return ["%s pass %d: too short to measure after trimming lead-in and "
+                "lead-out" % (name, n)]
+
+    ref = measured[0]
+    ref_revs = samples[ref][REVS]
+    ref_z = samples[ref][ZPOS]
+    # Z advances by pitch per revolution; the sign follows the cut direction.
+    z_dir = -1.0 if samples[measured[-1]][ZPOS] < ref_z else 1.0
+
+    def residual(i):
+        expected = ref_z + z_dir * direction * (samples[i][REVS] - ref_revs) * PITCH
+        return samples[i][ZPOS] - expected
+
+    worst = max(measured, key=lambda i: abs(residual(i)))
+    worst_err = residual(worst)
+
+    errors = []
+    if abs(worst_err) > TOLERANCE:
+        errors.append(
+            "%s pass %d: pitch error reached %.4f mm at sample %d "
+            "(tolerance %.4f mm)"
+            % (name, n, worst_err, int(samples[worst][IDX]), TOLERANCE))
+
+    # Did the error step at a disturbance?  This is the discriminating check: a
+    # correct implementation shows the same residual before and after.
+    n_win = int(WINDOW / SERVO_PERIOD)
+    for point in disturbances(samples, run):
+        before = [i for i in measured if point - n_win <= i < point]
+        after = [i for i in measured if point < i <= point + n_win]
+        if not before or not after:
+            continue
+        max_before = max(abs(residual(i)) for i in before)
+        max_after = max(abs(residual(i)) for i in after)
+        if max_after - max_before > TOLERANCE / 2:
+            errors.append(
+                "%s pass %d: pitch error jumped from %.4f mm to %.4f mm across "
+                "the disturbance at sample %d - Z stopped following the spindle"
+                % (name, n, max_before, max_after, int(samples[point][IDX])))
+
+    if errors:
+        errors.append(trace(name, n, samples, measured, residual))
+    else:
+        print("%s pass %d: OK - worst pitch error %.4f mm over %.1f revolutions"
+              % (name, n, worst_err,
+                 abs(samples[measured[-1]][REVS] - ref_revs)))
+    return errors
+
+
+def trace(name, n, samples, measured, residual):
+    """A coarse trace, so the shape of the failure is visible: a step at the
+    disturbance is a velocity leak, a permanent offset is a lost reference."""
+    lines = ["%s pass %d: trace (revs, Z, error mm, spindle rps, disturb):"
+             % (name, n)]
+    step = max(1, len(measured) // 40)
+    for i in measured[::step]:
+        s = samples[i]
+        lines.append("    %8.3f  %9.4f  %+9.5f  %7.3f  %s"
+                     % (s[REVS], s[ZPOS], residual(i), s[SPEED],
+                        "*" if s[DISTURB] else ""))
+    return "\n".join(lines)
+
+
+def analyse_sanity(name, samples, run):
+    """Control case: on an ordinary feed move the override MUST bite.
+
+    If this fails, the override never reached motion, and every "the thread was
+    undisturbed" result in this test is worthless.
+    """
+    n_win = int(WINDOW / SERVO_PERIOD)
+    points = disturbances(samples, run)
+    if not points:
+        return ["%s: control case recorded no disturbance at all" % name]
+
+    errors = []
+    for point in points:
+        # "before" ends at the marker's rising edge, which test-ui.py raises
+        # just before commanding the change; "after" starts once the machine
+        # has had time to respond.
+        before = [i for i in run if point - n_win <= i < point]
+        after = [i for i in run if point + n_win // 2 < i <= point + n_win]
+        if not before or not after:
+            continue
+        v_before = max(samples[i][VEL] for i in before)
+        v_after = max(samples[i][VEL] for i in after)
+        if abs(v_after - v_before) < 0.5:
+            errors.append(
+                "%s: control case - velocity stayed at %.3f mm/s across the "
+                "override change at sample %d, so the override never took "
+                "effect and the threading results prove nothing"
+                % (name, v_before, int(samples[point][IDX])))
+        else:
+            print("%s: control OK - velocity %.3f -> %.3f mm/s at sample %d"
+                  % (name, v_before, v_after, int(samples[point][IDX])))
+    return errors
+
+
+def analyse(name, path):
+    samples = load(path)
+    if not samples:
+        return ["%s: no samples captured" % name]
+
+    passes = threading_passes(samples)
+    if not passes:
+        return ["%s: no cutting pass found in the log - the move never ran, "
+                "or the M64/M65 markers did not bracket it" % name]
+
+    if name.startswith("sanity-"):
+        return analyse_sanity(name, samples, passes[0])
+
+    errors = []
+    disturbed = 0
+    for n, run in enumerate(passes, start=1):
+        disturbed += len(disturbances(samples, run))
+        errors.extend(analyse_pass(name, n, samples, run))
+
+    # A threading case that was never actually disturbed has tested nothing.
+    if not disturbed:
+        errors.append(
+            "%s: no disturbance landed inside a threading pass - the sweep "
+            "missed the cut, so this case passed vacuously" % name)
+    return errors
+
+
+all_errors = []
+for path in sorted(glob.glob("*.halsamples")):
+    all_errors.extend(analyse(os.path.basename(path)[:-len(".halsamples")], path))
+
+if all_errors:
+    for err in all_errors:
+        print(err)
+    sys.exit(1)
+
+sys.exit(0)

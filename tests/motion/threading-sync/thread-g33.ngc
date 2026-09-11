@@ -1,0 +1,15 @@
+( G33 straight threading pass, 1.5 mm pitch, 40 mm long )
+( M64 P0 / M65 P0 bracket the synchronized segment for the logger.  Both are )
+( queued with motion, so the marker lands exactly on the segment boundaries. )
+G21 G18 G90 G94
+G64 P0.01
+M52 P1 ( adaptive feed on - the pin sits at 1.0 unless the sweep drives it )
+G0 X10 Z5
+M3 S300
+G4 P1.0 ( let the simulated spindle settle before the sync move )
+M64 P0
+G33 Z-40 K1.5
+M65 P0
+G0 X20
+M5
+M2

@@ -1,0 +1,17 @@
+( G76 threading cycle - the case reported on the machine. )
+( J/K are chosen to give two passes, so the cycle stays short while still )
+( covering the pass-to-pass re-sync.  G76 wraps each pass in )
+( DISABLE_FEED_OVERRIDE/ENABLE_FEED_OVERRIDE, so this program also tests )
+( whether that masking actually holds. )
+G21 G18 G90 G94
+G64 P0.01
+M52 P1
+G0 X12 Z5
+M3 S300
+G4 P1.0
+M64 P0
+G76 P1.5 Z-40 I-0.1 J0.8 K0.9 R1 Q0 H0 E0 L0
+M65 P0
+G0 X20
+M5
+M2

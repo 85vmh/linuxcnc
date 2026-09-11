@@ -1,0 +1,16 @@
+( Control case: the same sweeps against an ordinary, NON-synchronized feed )
+( move.  Here the override is supposed to change the velocity.  Without this, )
+( "the override did not disturb the thread" could equally mean "the override )
+( command never arrived", and the threading results would prove nothing. )
+G21 G18 G90 G94
+G64 P0.01
+M52 P1
+G0 X10 Z5
+M3 S300
+G4 P1.0
+M64 P0
+G1 Z-40 F450 ( same 7.5 mm/s the 1.5 mm thread runs at, so the logs compare )
+M65 P0
+G0 X20
+M5
+M2

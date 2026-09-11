@@ -1,0 +1,33 @@
+# Two-joint (X, Z) simulated lathe for the spindle-sync threading test.
+#
+# The simulated spindle with index pulse comes from LIB:sim_spindle_encoder.hal,
+# loaded as the second HALFILE by threading-sync.ini.  The logger is wired up in
+# postgui.hal, once every signal it taps exists.
+
+loadrt [KINS]KINEMATICS
+loadrt [EMCMOT]EMCMOT base_period_nsec=[EMCMOT]BASE_PERIOD servo_period_nsec=[EMCMOT]SERVO_PERIOD num_joints=[KINS]JOINTS
+
+addf motion-command-handler servo-thread
+addf motion-controller servo-thread
+
+# Position command loopback: the axes follow the trajectory planner exactly, so
+# what is logged is what the planner commanded, with no servo lag in the way.
+net Xpos joint.0.motor-pos-cmd => joint.0.motor-pos-fb
+net Zpos joint.1.motor-pos-cmd => joint.1.motor-pos-fb
+
+net estop-loop iocontrol.0.user-enable-out iocontrol.0.emc-enable-in
+net tool-prep-loop iocontrol.0.tool-prepare iocontrol.0.tool-prepared
+net tool-change-loop iocontrol.0.tool-change iocontrol.0.tool-changed
+
+# Data logger.  This addf lands between motion-controller and the sim_spindle
+# functions (which LIB:sim_spindle_encoder.hal appends afterwards), so a sample
+# pairs the spindle revs the planner actually consumed this cycle with the Z
+# command it produced from them.  Sampling after sim_spindle would skew the two
+# by one servo period, which at 5 rev/s and 1.5 mm pitch is 7.5 um of phantom
+# pitch error - half the tolerance this test asserts.
+#
+# The sampler starts disabled and is enabled by test-ui.py once halsampler has
+# attached, so the captured stream holds the run and nothing else.
+loadrt sampler depth=50000 cfg=fffffbb
+addf sampler.0 servo-thread
+setp sampler.0.enable 0
