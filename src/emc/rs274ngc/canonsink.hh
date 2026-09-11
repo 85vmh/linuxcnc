@@ -23,7 +23,7 @@
 #ifndef CANONSINK_HH
 #define CANONSINK_HH
 
-#include "canon.hh"
+#include "nml_intf/canon.hh"
 #include "interp_base.hh"
 
 /* Modal snapshot handed to next_line().  Mirrors the layout that the
