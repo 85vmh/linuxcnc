@@ -46,6 +46,9 @@ struct iocontrol_str {
     //tool-change
     hal_bool_t tool_change;      /* output, notifies a tool-change should happen (emc should be in the tool-change position) */
     hal_bool_t tool_changed;     /* input, notifies tool has been changed */
+    //tool-change-pos, initialized from [EMCIO]TOOL_CHANGE_POSITION, never reset
+    hal_real_t tool_change_pos[9];      /* io, X Y Z A B C U V W in machine units, G53 */
+    hal_bool_t tool_change_pos_enable;  /* io, TRUE to use tool_change_pos for M6 */
 
     // note: spindle control has been moved to motion
 };                        //pointer to the HAL-struct
@@ -80,6 +83,8 @@ public:
     void run();
     int read_tool_inputs(void);
     void hal_init_pins(void);
+    void init_tool_change_pos_pins(void);
+    bool getToolChangePosition(EmcPose &pos);
 
     EMC_IO_STAT &emcioStatus;
     int random_toolchanger {0};

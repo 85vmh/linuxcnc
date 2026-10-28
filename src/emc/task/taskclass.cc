@@ -63,6 +63,11 @@ int Task::iocontrol_hal_init(void)
     CHK(hal_pin_new_bool(comp_id, HAL_IN,  &iocontrol_data->tool_prepared,    0, IOC0".tool-prepared"));
     CHK(hal_pin_new_bool(comp_id, HAL_OUT, &iocontrol_data->tool_change,      0, IOC0".tool-change"));
     CHK(hal_pin_new_bool(comp_id, HAL_IN,  &iocontrol_data->tool_changed,     0, IOC0".tool-changed"));
+    for (int i = 0; i < 9; i++) {
+        CHK(hal_pin_new_real(comp_id, HAL_IO, &iocontrol_data->tool_change_pos[i], 0.0,
+                             IOC0".tool-change-pos-%c", "xyzabcuvw"[i]));
+    }
+    CHK(hal_pin_new_bool(comp_id, HAL_IO,  &iocontrol_data->tool_change_pos_enable, 0, IOC0".tool-change-pos-enable"));
     if(hal_ready(comp_id) < 0) {
         hal_exit(comp_id);
         comp_id = -1;
@@ -93,6 +98,54 @@ void Task::hal_init_pins(void)
     hal_set_si32(iocontrol_data->tool_prep_index, 0);    /* output, pin that holds the internal index (idx) of the tool to be prepared, for debug */
     hal_set_bool(iocontrol_data->tool_change, 0);        /* output, notifies a tool-change should happen (emc should be in the tool-change position) */
     hal_set_si32(iocontrol_data->tool_number, emcioStatus.tool.toolInSpindle);
+    // tool-change-pos-* are deliberately not reset here, they keep
+    // the last value set from outside until LinuxCNC is restarted
+}
+
+/********************************************************************
+*
+* Description: init_tool_change_pos_pins(void)
+*
+* Side Effects: Sets tool-change-pos-* pins from the INI defaults.
+*
+* Called By: emcIoInit, after iniTool()
+********************************************************************/
+void Task::init_tool_change_pos_pins(void)
+{
+    if (comp_id < 0 || !iocontrol_data) {
+        return;
+    }
+    const double p[9] = {
+        tool_change_position.tran.x, tool_change_position.tran.y, tool_change_position.tran.z,
+        tool_change_position.a, tool_change_position.b, tool_change_position.c,
+        tool_change_position.u, tool_change_position.v, tool_change_position.w,
+    };
+    for (int i = 0; i < 9; i++) {
+        hal_set_real(iocontrol_data->tool_change_pos[i], have_tool_change_position ? p[i] : 0.0);
+    }
+    hal_set_bool(iocontrol_data->tool_change_pos_enable, have_tool_change_position != 0);
+}
+
+// Returns true and fills pos (machine units, G53) when the
+// tool-change-pos-* pins are present and enabled
+bool Task::getToolChangePosition(EmcPose &pos)
+{
+    if (comp_id < 0 || !iocontrol_data) {
+        return false;
+    }
+    if (!hal_get_bool(iocontrol_data->tool_change_pos_enable)) {
+        return false;
+    }
+    pos.tran.x = hal_get_real(iocontrol_data->tool_change_pos[0]);
+    pos.tran.y = hal_get_real(iocontrol_data->tool_change_pos[1]);
+    pos.tran.z = hal_get_real(iocontrol_data->tool_change_pos[2]);
+    pos.a = hal_get_real(iocontrol_data->tool_change_pos[3]);
+    pos.b = hal_get_real(iocontrol_data->tool_change_pos[4]);
+    pos.c = hal_get_real(iocontrol_data->tool_change_pos[5]);
+    pos.u = hal_get_real(iocontrol_data->tool_change_pos[6]);
+    pos.v = hal_get_real(iocontrol_data->tool_change_pos[7]);
+    pos.w = hal_get_real(iocontrol_data->tool_change_pos[8]);
+    return true;
 }
 
 Task *task_methods;
@@ -377,7 +430,10 @@ int Task::emcIoInit()//EMC_TOOL_INIT
     tooldata_load(tooltable_filename);
     reload_tool_number(emcioStatus.tool.toolInSpindle);
 
-    if (0 != iniTool(emc_inifile)) {
+    int retval = iniTool(emc_inifile);
+    // pins exist (emcTaskOnce) and the INI is parsed, seed the defaults
+    init_tool_change_pos_pins();
+    if (0 != retval) {
 	return -1;
     }
     return 0;
