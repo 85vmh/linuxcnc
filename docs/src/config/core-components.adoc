@@ -307,6 +307,14 @@ iocontrol's HAL pins are turned on and off in non-realtime context.  If you have
 * 'iocontrol.0.emc-enable-in' (bool, in) Should be driven FALSE when an external E-Stop condition exists.
 * 'iocontrol.0.tool-change' (bool, out) TRUE when a tool change is requested.
 * 'iocontrol.0.tool-changed' (bool, in) Should be driven TRUE when a tool change is completed.
+* 'iocontrol.0.tool-change-pos-enable' (bool, I/O) When TRUE, M6 moves to the position given by the 'tool-change-pos-<axis>' pins instead of the `[EMCIO]TOOL_CHANGE_POSITION` INI setting.
+  Starts TRUE if `TOOL_CHANGE_POSITION` is set in the INI file, FALSE otherwise.
+* 'iocontrol.0.tool-change-pos-<axis>' (float, I/O) Tool change position for each axis listed in `[TRAJ]COORDINATES` (x, y, z, a, b, c, u, v, w), in machine units and G53 (machine) coordinates.
+  Starts with the value from `TOOL_CHANGE_POSITION`; axes not given there start as NaN.
+  An axis whose pin is NaN is not moved on M6.
++
+These pins are never reset by LinuxCNC (not on E-stop or abort), so a value set by a GUI or HMI is kept until LinuxCNC is restarted.
+They are read when the interpreter processes M6, which can happen ahead of execution (read-ahead), so set them before cycle start.
 * 'iocontrol.0.tool-number' (sint, out) The current tool number.
 * 'iocontrol.0.tool-prep-number' (sint, out) The number of the next tool, from the RS274NGC T-word.
 * 'iocontrol.0.tool-prepare' (bool, out) TRUE when a tool prepare is requested.

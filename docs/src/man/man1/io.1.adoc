@@ -38,6 +38,19 @@ unless an absolute path is specified.
   TRUE when a tool change is requested.
 *iocontrol.0.tool-changed* (bool, in)::
   Should be driven TRUE when a tool change is completed.
+*iocontrol.0.tool-change-pos-enable* (bool, I/O)::
+  When TRUE, M6 moves to the position given by the
+  **tool-change-pos-**__axis__ pins instead of [EMCIO]TOOL_CHANGE_POSITION.
+  Starts TRUE if TOOL_CHANGE_POSITION is set in the INI file, FALSE otherwise.
+**iocontrol.0.tool-change-pos-**__axis__ (float, I/O)::
+  Tool change position for each axis (x y z a b c u v w) listed in
+  [TRAJ]COORDINATES, in machine units and G53 (machine) coordinates.
+  Starts with the value from TOOL_CHANGE_POSITION; axes not given
+  there start as NaN. An axis whose pin is NaN is not moved on M6.
+  These pins are never reset by LinuxCNC (not on E-stop or abort), so a
+  value set from outside is kept until LinuxCNC is restarted. They are
+  read when the interpreter processes M6, which can happen ahead of
+  execution (read-ahead), so set them before cycle start.
 *iocontrol.0.tool-number* (sint, out)::
   Current tool number.
 *iocontrol.0.tool-prep-number* (sint, out)::
