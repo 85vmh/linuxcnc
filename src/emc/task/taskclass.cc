@@ -64,6 +64,10 @@ int Task::iocontrol_hal_init(void)
     CHK(hal_pin_new_bool(comp_id, HAL_OUT, &iocontrol_data->tool_change,      0, IOC0".tool-change"));
     CHK(hal_pin_new_bool(comp_id, HAL_IN,  &iocontrol_data->tool_changed,     0, IOC0".tool-changed"));
     for (int i = 0; i < 9; i++) {
+        iocontrol_data->tool_change_pos[i] = nullptr;
+        if (!(axis_mask & (1 << i))) {
+            continue;
+        }
         CHK(hal_pin_new_real(comp_id, HAL_IO, &iocontrol_data->tool_change_pos[i], 0.0,
                              IOC0".tool-change-pos-%c", "xyzabcuvw"[i]));
     }
@@ -120,15 +124,21 @@ void Task::init_tool_change_pos_pins(void)
         tool_change_position.a, tool_change_position.b, tool_change_position.c,
         tool_change_position.u, tool_change_position.v, tool_change_position.w,
     };
+    // axes not given in TOOL_CHANGE_POSITION start as NaN, which keeps
+    // them in place on M6 like before
     for (int i = 0; i < 9; i++) {
-        hal_set_real(iocontrol_data->tool_change_pos[i], have_tool_change_position ? p[i] : 0.0);
+        if (iocontrol_data->tool_change_pos[i]) {
+            hal_set_real(iocontrol_data->tool_change_pos[i], i < have_tool_change_position ? p[i] : NAN);
+        }
     }
     hal_set_bool(iocontrol_data->tool_change_pos_enable, have_tool_change_position != 0);
 }
 
 // Returns true and fills pos (machine units, G53) when the
-// tool-change-pos-* pins are present and enabled
-bool Task::getToolChangePosition(EmcPose &pos)
+// tool-change-pos-* pins are present and enabled. axes gets the
+// mask of the axes that have a pin with a non-NaN value, the
+// others are left at 0 and should not be moved.
+bool Task::getToolChangePosition(EmcPose &pos, int &axes)
 {
     if (comp_id < 0 || !iocontrol_data) {
         return false;
@@ -136,15 +146,20 @@ bool Task::getToolChangePosition(EmcPose &pos)
     if (!hal_get_bool(iocontrol_data->tool_change_pos_enable)) {
         return false;
     }
-    pos.tran.x = hal_get_real(iocontrol_data->tool_change_pos[0]);
-    pos.tran.y = hal_get_real(iocontrol_data->tool_change_pos[1]);
-    pos.tran.z = hal_get_real(iocontrol_data->tool_change_pos[2]);
-    pos.a = hal_get_real(iocontrol_data->tool_change_pos[3]);
-    pos.b = hal_get_real(iocontrol_data->tool_change_pos[4]);
-    pos.c = hal_get_real(iocontrol_data->tool_change_pos[5]);
-    pos.u = hal_get_real(iocontrol_data->tool_change_pos[6]);
-    pos.v = hal_get_real(iocontrol_data->tool_change_pos[7]);
-    pos.w = hal_get_real(iocontrol_data->tool_change_pos[8]);
+    double p[9] = {};
+    axes = 0;
+    for (int i = 0; i < 9; i++) {
+        if (iocontrol_data->tool_change_pos[i]) {
+            double v = hal_get_real(iocontrol_data->tool_change_pos[i]);
+            if (!isnan(v)) {
+                p[i] = v;
+                axes |= 1 << i;
+            }
+        }
+    }
+    pos.tran.x = p[0]; pos.tran.y = p[1]; pos.tran.z = p[2];
+    pos.a = p[3]; pos.b = p[4]; pos.c = p[5];
+    pos.u = p[6]; pos.v = p[7]; pos.w = p[8];
     return true;
 }
 
@@ -233,6 +248,18 @@ Task::Task(EMC_IO_STAT & emcioStatus_in) :
         if (tooltable_filename != NULL && db_program[0] != '\0') {
             fprintf(stderr,"DB_PROGRAM active: IGNORING tool table file %s\n",
                     tooltable_filename);
+        }
+
+        // same rule as loadTraj() in initraj.cc
+        if (auto coord = inifile.findString("COORDINATES", "TRAJ")) {
+            static const std::string axes{"XYZABCUVW"};
+            for (auto c : *coord) {
+                size_t n = axes.find_first_of(std::toupper(c & 0xff));
+                if (n != std::string::npos)
+                    axis_mask |= 1 << n;
+            }
+        } else {
+            axis_mask = (1<<0) | (1<<1) | (1<<2); // X, Y and Z machine
         }
     }
 

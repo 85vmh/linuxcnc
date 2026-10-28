@@ -3092,20 +3092,22 @@ void CHANGE_TOOL()
      * is called.  */
     
     /* tool-change-pos-* HAL pins, when enabled, override the
-     * INI position on all 9 axes */
+     * INI position on every configured axis; axes without a pin,
+     * or whose pin is NaN, stay where they are */
     EmcPose hal_pos;
-    if (task_methods && task_methods->getToolChangePosition(hal_pos)) {
+    int hal_axes = 0;
+    if (task_methods && task_methods->getToolChangePosition(hal_pos, hal_axes)) {
         double x, y, z, a, b, c, u, v, w;
 
-        x = FROM_EXT_LEN(hal_pos.tran.x);
-        y = FROM_EXT_LEN(hal_pos.tran.y);
-        z = FROM_EXT_LEN(hal_pos.tran.z);
-        a = FROM_EXT_AX(AXIS_A, hal_pos.a);
-        b = FROM_EXT_AX(AXIS_B, hal_pos.b);
-        c = FROM_EXT_AX(AXIS_C, hal_pos.c);
-        u = FROM_EXT_AX(AXIS_U, hal_pos.u);
-        v = FROM_EXT_AX(AXIS_V, hal_pos.v);
-        w = FROM_EXT_AX(AXIS_W, hal_pos.w);
+        x = (hal_axes & (1<<0)) ? FROM_EXT_LEN(hal_pos.tran.x) : canon.endPoint.x;
+        y = (hal_axes & (1<<1)) ? FROM_EXT_LEN(hal_pos.tran.y) : canon.endPoint.y;
+        z = (hal_axes & (1<<2)) ? FROM_EXT_LEN(hal_pos.tran.z) : canon.endPoint.z;
+        a = (hal_axes & (1<<3)) ? FROM_EXT_AX(AXIS_A, hal_pos.a) : canon.endPoint.a;
+        b = (hal_axes & (1<<4)) ? FROM_EXT_AX(AXIS_B, hal_pos.b) : canon.endPoint.b;
+        c = (hal_axes & (1<<5)) ? FROM_EXT_AX(AXIS_C, hal_pos.c) : canon.endPoint.c;
+        u = (hal_axes & (1<<6)) ? FROM_EXT_AX(AXIS_U, hal_pos.u) : canon.endPoint.u;
+        v = (hal_axes & (1<<7)) ? FROM_EXT_AX(AXIS_V, hal_pos.v) : canon.endPoint.v;
+        w = (hal_axes & (1<<8)) ? FROM_EXT_AX(AXIS_W, hal_pos.w) : canon.endPoint.w;
 
         send_tool_change_move(x, y, z, a, b, c, u, v, w);
     } else if (have_tool_change_position) {
