@@ -99,8 +99,12 @@ static char* tool_mmap_fname(void) {
     return(filename);
 }
 
+// Every entry point below answers "no data" when nothing is mapped - a
+// process that never created or attached the mmap (gcode.parse with no
+// LinuxCNC running) - rather than dereferencing a null base.
 static int tool_mmap_mutex_get()
 {
+    if (!tool_mmap_base) { return -1; }
     tooldata_header_t *hptr = HPTR();
     useconds_t waited_us  =      0;
     useconds_t delta_us   =    100;
@@ -126,6 +130,7 @@ static int tool_mmap_mutex_get()
 
 static void tool_mmap_mutex_give()
 {
+    if (!tool_mmap_base) { return; }
     tooldata_header_t *hptr = HPTR();
     rtapi_mutex_give(&(hptr->mutex));
 } // tool_mmap_mutex_give()
@@ -133,6 +138,7 @@ static void tool_mmap_mutex_give()
 bool tool_mmap_is_random_toolchanger(void)
 {
     bool ans = 0;
+    if (!tool_mmap_base) { return ans; }
     tool_mmap_mutex_get();
     tooldata_header_t *hptr = HPTR();
     ans = hptr->is_random_toolchanger;
@@ -140,50 +146,78 @@ bool tool_mmap_is_random_toolchanger(void)
     return ans;
 }
 
-//typ creator: emc/ioControl.cc, sai/driver.cc
-//    (first applicable process started in linuxcnc script)
-int tool_mmap_creator(EMC_TOOL_STAT const * ptr,int random_toolchanger)
+// Create the mmap file and map it. -1 with the reason in `why` on failure,
+// with nothing left open or mapped.
+static int tool_mmap_create(EMC_TOOL_STAT const * ptr,int random_toolchanger,
+                            char *why,size_t whylen)
 {
-    static int inited=0;
-
-    if (inited) {
-        fprintf(stderr,"Error: tool_mmap_creator already called BYE\n");
-        exit(EXIT_FAILURE);
+    int fd = open(tool_mmap_fname(),
+                  TOOL_MMAP_CREATOR_OPEN_FLAGS,TOOL_MMAP_MODE);
+    if (fd < 0) {
+        snprintf(why,whylen,"file open fail: %s",strerror(errno));
+        return -1;
     }
+    if (lseek(fd, TOOL_MMAP_SIZE, SEEK_SET) == -1) {
+        snprintf(why,whylen,"lseek fail: %s",strerror(errno));
+        close(fd);
+        return -1;
+    }
+    if (write(fd, "\0", 1) < 0) {
+        snprintf(why,whylen,"file tail write fail: %s",strerror(errno));
+        close(fd);
+        return -1;
+    }
+    char *base = (char*)mmap(NULL, TOOL_MMAP_SIZE, PROT_READ | PROT_WRITE,
+                             MAP_SHARED, fd, 0);
+    if (base == MAP_FAILED) {
+        snprintf(why,whylen,"mmap fail: %s",strerror(errno));
+        close(fd);
+        return -1;
+    }
+
     toolstat = ptr; //note NULL for sai
-    creator_fd = open(tool_mmap_fname(),
-                     TOOL_MMAP_CREATOR_OPEN_FLAGS,TOOL_MMAP_MODE);
-    if (creator_fd < 0) {
-        perror("tool_mmap_creator(): file open fail");
-        exit(EXIT_FAILURE);
-    }
-    if (lseek(creator_fd, TOOL_MMAP_SIZE, SEEK_SET) == -1) {
-        close(creator_fd);
-        perror("tool_mmap_creator() lseek fail");
-        exit(EXIT_FAILURE);
-    }
-    if (write(creator_fd, "\0", 1) < 0) {
-        close(creator_fd);
-        perror("tool_mmap_creator(): file tail write fail");
-        exit(EXIT_FAILURE);
-    }
-    tool_mmap_base = (char*)mmap(NULL, TOOL_MMAP_SIZE, PROT_READ | PROT_WRITE,
-                                 MAP_SHARED, creator_fd, 0);
-    if (tool_mmap_base == MAP_FAILED) {
-        close(creator_fd);
-        perror("tool_mmap_creator(): mmap fail");
-        exit(EXIT_FAILURE);
-    }
-
+    creator_fd = fd;
+    tool_mmap_base = base;
     tooldata_header_t *hptr = HPTR();
     hptr->is_random_toolchanger = random_toolchanger;
     hptr->last_index = 0;
 
     mmap_fd = creator_fd;
     mmap_is_creator = true;
-    inited = 1;
     tool_mmap_mutex_give(); return 0;
+} // tool_mmap_create()
+
+//typ creator: emc/ioControl.cc, sai/driver.cc
+//    (first applicable process started in linuxcnc script)
+int tool_mmap_creator(EMC_TOOL_STAT const * ptr,int random_toolchanger)
+{
+    static int inited=0;
+    char why[LINELEN] = {};
+
+    if (inited) {
+        fprintf(stderr,"Error: tool_mmap_creator already called BYE\n");
+        exit(EXIT_FAILURE);
+    }
+    if (tool_mmap_create(ptr,random_toolchanger,why,sizeof(why))) {
+        fprintf(stderr,"tool_mmap_creator(): %s\n",why);
+        exit(EXIT_FAILURE);
+    }
+    inited = 1;
+    return 0;
 } // tool_mmap_creator();
+
+// For a library user (the gcode Python module) that must not exit: create
+// the mmap at the name set by tool_mmap_set_fname(), or answer -1 with the
+// reason. May be called again once tool_mmap_close() dropped the last one.
+int tool_mmap_creator_try(EMC_TOOL_STAT const * ptr,int random_toolchanger,
+                          char *why,size_t whylen)
+{
+    if (tool_mmap_base) {
+        snprintf(why,whylen,"a tool mmap is already open");
+        return -1;
+    }
+    return tool_mmap_create(ptr,random_toolchanger,why,whylen);
+} // tool_mmap_creator_try()
 
 //typ: milltask, guis (emcmodule,emcsh,...), halui
 int tool_mmap_user()
@@ -267,6 +301,7 @@ void tool_mmap_close()
 
 void tooldata_last_index_set(int idx)  //force last_index
 {
+    if (!tool_mmap_base) { return; }
     tool_mmap_mutex_get();
     tooldata_header_t *hptr = HPTR();
     if (idx < 0 || idx >= CANON_POCKETS_MAX) {
@@ -280,13 +315,10 @@ void tooldata_last_index_set(int idx)  //force last_index
 
 int tooldata_last_index_get(void)
 {
+    if (!tool_mmap_base) { return -1; }
     tool_mmap_mutex_get();
     tooldata_header_t *hptr = HPTR();
-    if (tool_mmap_base) {
-        tool_mmap_mutex_give(); return hptr->last_index;
-    } else {
-        tool_mmap_mutex_give(); return -1;
-    }
+    tool_mmap_mutex_give(); return hptr->last_index;
 } // tooldata_last_index_get()
 
 toolidx_t tooldata_put(struct CANON_TOOL_TABLE tdata,int idx)
@@ -326,6 +358,7 @@ toolidx_t tooldata_put(struct CANON_TOOL_TABLE tdata,int idx)
 void tooldata_reset()
 {
     CANON_TOOL_TABLE initdata = tooldata_entry_init();
+    if (!tool_mmap_base) { return; }
     tool_mmap_mutex_get();
     int idx;
     for (idx = 0; idx < CANON_POCKETS_MAX; idx++) {
@@ -338,8 +371,7 @@ void tooldata_reset()
 toolidx_t tooldata_get(CANON_TOOL_TABLE* pdata, int idx)
 {
     if (!tool_mmap_base) {
-        fprintf(stderr,"%5d tooldata_get() not mmapped BYE\n", getpid() );
-        exit(EXIT_FAILURE);
+        return IDX_FAIL;
     }
     if (idx < 0 || idx >= CANON_POCKETS_MAX) {
         // ui programs may query for nonexistent idx values
@@ -358,6 +390,7 @@ toolidx_t tooldata_get(CANON_TOOL_TABLE* pdata, int idx)
 
 int tooldata_find_index_for_tool(int toolno)
 {
+    if (!tool_mmap_base) { return -1; } // not found: nothing is loaded
     tooldata_header_t *hptr = HPTR();
     tool_mmap_mutex_get();
     int idx;

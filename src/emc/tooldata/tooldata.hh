@@ -81,6 +81,8 @@ int tooldata_save(const char *filename);
 //mmap specific
 void tool_mmap_set_fname(const char* fname);
 int  tool_mmap_creator(EMC_TOOL_STAT const  *ptr,int random_toolchanger);
+int  tool_mmap_creator_try(EMC_TOOL_STAT const *ptr,int random_toolchanger,
+                           char *why,size_t whylen);
 int  tool_mmap_user(void);
 void tool_mmap_close(void);
 bool tool_mmap_is_random_toolchanger(void);
