@@ -228,6 +228,23 @@ static void linecode_register(py::module_ &m) {
 
 ParseState parse_state;
 
+void remember_canon_error() {
+    if(parse_state.error_type || !PyErr_Occurred()) return;
+    PyObject *type, *value, *traceback;
+    PyErr_Fetch(&type, &value, &traceback);
+    Py_XINCREF(type); Py_XINCREF(value); Py_XINCREF(traceback);
+    parse_state.error_type = type;
+    parse_state.error_value = value;
+    parse_state.error_traceback = traceback;
+    PyErr_Restore(type, value, traceback);
+}
+
+static void forget_canon_error() {
+    Py_CLEAR(parse_state.error_type);
+    Py_CLEAR(parse_state.error_value);
+    Py_CLEAR(parse_state.error_traceback);
+}
+
 int ParseState::current_line() const {
     return pinterp ? pinterp->sequence_number() : last_sequence_number;
 }
@@ -235,14 +252,50 @@ int ParseState::current_line() const {
 static void maybe_new_line(int sequence_number);
 static void maybe_new_line();
 
-// Deliver next_line to the canon, at most once per source line.
+// Which file the interpreter is reading and how deep in calls and remaps it
+// is: the main program, or a subroutine's or a remap's .ngc, made absolute.
+// False for an interpreter that is not ours, which does not say.
+static bool current_source(const std::string *&file, int &call_level) {
+    Interp *interp = dynamic_cast<Interp *>(parse_state.pinterp);
+    if(!interp) return false;
+    // realpath() once per file rather than once per line
+    static std::string raw, absolute;
+    const char *name = interp->_setup.filename;
+    // the line before the first (next_line 0) comes ahead of the
+    // interpreter naming the file it opened: that is the main program
+    if(!*name && interp->_setup.call_level == 0) name = parse_state.main_file.c_str();
+    if(raw != name) {
+        raw = name;
+        char buf[PATH_MAX];
+        absolute = *name && realpath(name, buf) ? buf : name;
+    }
+    file = &absolute;
+    call_level = interp->_setup.call_level;
+    return true;
+}
+
+// Deliver next_line to the canon, at most once per source line - and then
+// source_line(filename, line, call_level) to a canon that defines it. For
+// such a canon a line is its number *in its file at its call level*, so the
+// first line of a subroutine or remap is delivered even when it has the
+// number the caller's line had; a canon without source_line keeps the
+// number-only test, and the sequence it always had.
 static void deliver_new_line(int sequence_number) {
     if(!parse_state.pinterp) return;
     if(parse_state.interp_error) return;
-    if(sequence_number == parse_state.last_delivered_sequence_number)
+    const std::string *file = nullptr;
+    int call_level = 0;
+    bool located = parse_state.has_source_line && current_source(file, call_level);
+    if(sequence_number == parse_state.last_delivered_sequence_number
+            && (!located || (call_level == parse_state.last_delivered_call_level
+                             && *file == parse_state.last_delivered_file)))
         return;
     parse_state.last_sequence_number = sequence_number;
     parse_state.last_delivered_sequence_number = sequence_number;
+    if(located) {
+        parse_state.last_delivered_file = *file;
+        parse_state.last_delivered_call_level = call_level;
+    }
     // Building it is inside the guard too: it is the one step here besides the
     // call that can fail, and it fails the way the call does - with the error
     // set - so the guard is what turns either into interp_error.
@@ -252,6 +305,12 @@ static void deliver_new_line(int sequence_number) {
         if(!line) throw py::error_already_set();
         py::handle(parse_state.callback).attr("next_line")(line);
     });
+    if(located) {
+        canon_guard([&]{
+            py::handle(parse_state.callback).attr("source_line")(
+                    *file, sequence_number, call_level);
+        });
+    }
 }
 
 static void maybe_new_line(int sequence_number) {
@@ -350,6 +409,8 @@ public:
         has_get_digital_input_ = canon_defines(cb, "get_digital_input");
         has_get_analog_input_ = canon_defines(cb, "get_analog_input");
         has_wait_ = canon_defines(cb, "wait");
+        has_tool_change_move_ = canon_defines(cb, "tool_change_move");
+        has_set_position_ = canon_defines(cb, "set_position");
     }
 
     void arc_feed(int line_number, double first_end, double second_end,
@@ -424,6 +485,16 @@ public:
     void set_traverse_rate(double rate) override {
         maybe_new_line();
         forward("set_traverse_rate", rate);
+    }
+    bool wants_tool_change_move() override { return has_tool_change_move_; }
+    void tool_change_move(int line_number, const Point9 &p) override {
+        maybe_new_line(line_number);
+        forward9("tool_change_move", p);
+    }
+    void set_position(const Point9 &p) override {
+        if(!has_set_position_) return;
+        maybe_new_line();
+        forward9("set_position", p);
     }
     void program_stop() override {
         if(!has_program_stop_) return;
@@ -526,6 +597,8 @@ private:
     bool has_get_digital_input_ = false;
     bool has_get_analog_input_ = false;
     bool has_wait_ = false;
+    bool has_tool_change_move_ = false;
+    bool has_set_position_ = false;
 };
 
 // The interpreter works in the program's own units; every canon method below
@@ -545,6 +618,87 @@ static Point9 ensure_inch(const Point9 &p) {
     for(int i = 0; i < 9; i++) q[i] = ensure_inch(i, p[i]);
     return q;
 }
+
+// Back from inches to the program's units, for what the interpreter reads.
+static Point9 from_inch(const Point9 &p) {
+    Point9 q;
+    for(int i = 0; i < 9; i++)
+        q[i] = (parse_state.angular >> i) & 1 || !parse_state.metric
+             ? p[i] : p[i] * 25.4;
+    return q;
+}
+
+// Machine units - the tool table's, TOOL_CHANGE_POSITION's, the iocontrol
+// pins' - to inches and degrees, by the canon's external units as the
+// interpreter converts a tool offset (USER_TO_PROGRAM_LEN).
+static Point9 machine_units_to_inch(const Point9 &m) {
+    double length_units = GET_EXTERNAL_LENGTH_UNITS();
+    double angle_units = GET_EXTERNAL_ANGLE_UNITS();
+    Point9 q;
+    for(int i = 0; i < 9; i++)
+        q[i] = (parse_state.angular >> i) & 1 ? m[i] / angle_units
+                                              : m[i] / length_units / 25.4;
+    return q;
+}
+
+// The program frame, in the order task's canon applies it
+// (rotate_and_offset_pos / unoffset_and_unrotate_pos in emccanon.cc):
+// machine = g5x + Rz(rotation_xy) * (g92 + frame(program)) + tool.
+static void rotate_xy(Point9 &p, double degrees) {
+    if(degrees == 0) return;
+    double t = degrees * M_PI / 180, c = cos(t), sn = sin(t);
+    double x = p[P9_X], y = p[P9_Y];
+    p[P9_X] = x * c - y * sn;
+    p[P9_Y] = x * sn + y * c;
+}
+
+static Point9 to_machine(Point9 p) {
+    parse_state.frame.apply(p);
+    p += parse_state.g92;
+    rotate_xy(p, parse_state.rotation_xy);
+    p += parse_state.g5x;
+    p += parse_state.tool;
+    return p;
+}
+
+static Point9 to_program(Point9 m) {
+    m -= parse_state.tool;
+    m -= parse_state.g5x;
+    rotate_xy(m, -parse_state.rotation_xy);
+    m -= parse_state.g92;
+    parse_state.frame.remove(m);
+    return m;
+}
+
+// A move was delivered and ends at `p` (inches, the straight_traverse
+// frame): the point the next move starts from, until an offset moves it.
+static void moved_to(const Point9 &p) {
+    parse_state.have_point = true;
+    parse_state.point = p;
+    parse_state.machine = to_machine(p);
+    parse_state.position_dirty = false;
+}
+
+// If an offset changed since the last move, the machine stayed where that
+// move left it and the program frame moved: tell the canon where that puts
+// the controlled point, unless it is the point it already has. Called
+// before every move and after every block, so it lands on the line that
+// changed the offset and ahead of any move after it.
+static void flush_position() {
+    if(!parse_state.position_dirty) return;
+    parse_state.position_dirty = false;
+    if(!parse_state.have_point || parse_state.interp_error) return;
+    Point9 now = to_program(parse_state.machine);
+    bool same = true;
+    for(int i = 0; i < 9; i++)
+        if(fabs(now[i] - parse_state.point[i])
+                > 1e-9 * (1 + fabs(parse_state.point[i]))) same = false;
+    if(same) return;
+    parse_state.point = now;
+    parse_state.canon->set_position(now);
+}
+
+static void offsets_changed() { parse_state.position_dirty = true; }
 
 // One point of a NURBS curve, fed through the canon. The curve's two
 // components land in the active plane and every other axis holds the position
@@ -639,6 +793,7 @@ void ARC_FEED(int line_number,
               double a_position, double b_position, double c_position,
               double u_position, double v_position, double w_position) {
     // XXX: set _pos_*
+    flush_position();
     parse_state.canon->arc_feed(line_number,
                                 ensure_inch(first_end),
                                 ensure_inch(second_end),
@@ -652,6 +807,16 @@ void ARC_FEED(int line_number,
                                 ensure_inch(P9_U, u_position),
                                 ensure_inch(P9_V, v_position),
                                 ensure_inch(P9_W, w_position));
+    // The end in the nine axes, by the plane's pairing of first and second.
+    Point9 end = {first_end, second_end, axis_end_point,
+                  a_position, b_position, c_position,
+                  u_position, v_position, w_position};
+    if(parse_state.plane == static_cast<int>(CANON_PLANE::XZ)) {
+        end[P9_X] = second_end; end[P9_Y] = axis_end_point; end[P9_Z] = first_end;
+    } else if(parse_state.plane == static_cast<int>(CANON_PLANE::YZ)) {
+        end[P9_X] = axis_end_point; end[P9_Y] = first_end; end[P9_Z] = second_end;
+    }
+    moved_to(ensure_inch(end));
 }
 
 void STRAIGHT_FEED(int line_number,
@@ -659,8 +824,10 @@ void STRAIGHT_FEED(int line_number,
                    double a, double b, double c,
                    double u, double v, double w) {
     parse_state.pos = {x, y, z, a, b, c, u, v, w};
-    parse_state.canon->straight_feed(line_number,
-            ensure_inch({x, y, z, a, b, c, u, v, w}));
+    flush_position();
+    Point9 p = ensure_inch({x, y, z, a, b, c, u, v, w});
+    parse_state.canon->straight_feed(line_number, p);
+    moved_to(p);
 }
 
 void STRAIGHT_TRAVERSE(int line_number,
@@ -668,26 +835,32 @@ void STRAIGHT_TRAVERSE(int line_number,
                        double a, double b, double c,
                        double u, double v, double w) {
     parse_state.pos = {x, y, z, a, b, c, u, v, w};
-    parse_state.canon->straight_traverse(line_number,
-            ensure_inch({x, y, z, a, b, c, u, v, w}));
+    flush_position();
+    Point9 p = ensure_inch({x, y, z, a, b, c, u, v, w});
+    parse_state.canon->straight_traverse(line_number, p);
+    moved_to(p);
 }
 
 void SET_G5X_OFFSET(int g5x_index,
                     double x, double y, double z,
                     double a, double b, double c,
                     double u, double v, double w) {
-    parse_state.canon->set_g5x_offset(g5x_index,
-            ensure_inch({x, y, z, a, b, c, u, v, w}));
+    parse_state.g5x = ensure_inch({x, y, z, a, b, c, u, v, w});
+    offsets_changed();
+    parse_state.canon->set_g5x_offset(g5x_index, parse_state.g5x);
 }
 
 void SET_G92_OFFSET(double x, double y, double z,
                     double a, double b, double c,
                     double u, double v, double w) {
-    parse_state.canon->set_g92_offset(
-            ensure_inch({x, y, z, a, b, c, u, v, w}));
+    parse_state.g92 = ensure_inch({x, y, z, a, b, c, u, v, w});
+    offsets_changed();
+    parse_state.canon->set_g92_offset(parse_state.g92);
 }
 
 void SET_XY_ROTATION(double t) {
+    parse_state.rotation_xy = t;
+    offsets_changed();
     parse_state.canon->set_xy_rotation(t);
 };
 
@@ -697,12 +870,15 @@ void SET_G68_FRAME(double x, double y, double z,
     frame.active = active != 0;
     frame.origin = ensure_inch({x, y, z});
     std::copy(rotation, rotation + 9, frame.rotation.begin());
+    parse_state.frame = frame;
+    offsets_changed();
     parse_state.canon->set_g68_frame(frame);
 };
 
 void USE_LENGTH_UNITS(CANON_UNITS u) { parse_state.metric = u == CANON_UNITS_MM; }
 
 void SELECT_PLANE(CANON_PLANE pl) {
+    parse_state.plane = static_cast<int>(pl);
     parse_state.canon->set_plane(static_cast<int>(pl));
 }
 
@@ -720,8 +896,77 @@ void SET_FEED_MODE(int /*spindle*/, int mode) {
     parse_state.canon->set_feed_mode(mode);
 }
 
+// Where task's canon would send the machine before this M6
+// (CHANGE_TOOL in emccanon.cc): the canon's get_tool_change_position() -
+// the iocontrol tool-change-pos-* pins of a simulator - when it answers nine
+// numbers, else [EMCIO]TOOL_CHANGE_POSITION, whose missing axes stay where
+// they are. Machine coordinates in inches; false for no move.
+static bool tool_change_target(Point9 &target) {
+    Point9 given = {};
+    int n = 0;
+    if(parse_state.has_get_tool_change_position) {
+        bool answered = false;
+        canon_guard([&]{
+            py::object r = py::handle(parse_state.callback)
+                    .attr("get_tool_change_position")();
+            if(r.is_none()) return;
+            if(!PySequence_Check(r.ptr()) || PySequence_Size(r.ptr()) != 9)
+                throw py::type_error("get_tool_change_position: expected "
+                                     "None or nine numbers");
+            py::sequence seq = py::reinterpret_borrow<py::sequence>(r);
+            for(size_t i = 0; i < 9; i++) given[i] = py::cast<double>(seq[i]);
+            answered = true;
+        });
+        if(parse_state.interp_error) return false;
+        if(answered) n = 9;
+    }
+    if(!n) {
+        n = parse_state.ini_tool_change_n;
+        given = parse_state.ini_tool_change;
+    }
+    if(!n) return false;
+    Point9 inch = machine_units_to_inch(given);
+    target = parse_state.have_point ? parse_state.machine
+                                    : to_machine(ensure_inch(parse_state.pos));
+    for(int i = 0; i < n; i++) target[i] = inch[i];
+    return true;
+}
+
+// The spindle slot of the private tool table at a tool change, as iocontrol
+// does it (emcToolLoad, then load_tool once the change is done).
+static void private_table_change_tool(int toolno) {
+    int idx = tooldata_find_index_for_tool(toolno);
+    if(idx < 0) return;
+    bool random = tool_mmap_is_random_toolchanger();
+    // it does not make sense to load a tool from the spindle pocket
+    if(random && idx == 0) return;
+    if(!random && idx > 0) {
+        // nor to load the tool already in the spindle
+        CANON_TOOL_TABLE wanted, spindle;
+        if(tooldata_get(&wanted, idx) == IDX_OK
+                && tooldata_get(&spindle, 0) == IDX_OK
+                && spindle.toolno == wanted.toolno)
+            return;
+    }
+    tooldata_load_spindle(idx, random);
+}
+
 void CHANGE_TOOL() {
+    // The move first, before the tool is changed, as task makes it. The
+    // interpreter resyncs to where it ends (refresh_actual_position after
+    // the M6 reads GET_EXTERNAL_POSITION_*), so the moves after the M6
+    // start from there.
+    Point9 target;
+    if(parse_state.canon->wants_tool_change_move() && tool_change_target(target)) {
+        flush_position();
+        Point9 p = to_program(target);
+        parse_state.canon->tool_change_move(parse_state.current_line(), p);
+        parse_state.pos = from_inch(p);
+        moved_to(p);
+    }
     parse_state.canon->change_tool(parse_state.selected_tool);
+    if(parse_state.private_tool_table)
+        private_table_change_tool(parse_state.selected_tool);
 }
 
 void CHANGE_TOOL_NUMBER(int /*pocket*/) {
@@ -768,11 +1013,12 @@ void SET_TOOL_TABLE_ENTRY(int /*pocket*/, int /*toolno*/, const EmcPose& /*offse
 }
 
 void USE_TOOL_LENGTH_OFFSET(const EmcPose& offset) {
-    parse_state.tool_offset = offset;
-    parse_state.canon->tool_offset(ensure_inch({
+    parse_state.tool = ensure_inch({
             offset.tran.x, offset.tran.y, offset.tran.z,
             offset.a, offset.b, offset.c,
-            offset.u, offset.v, offset.w}));
+            offset.u, offset.v, offset.w});
+    offsets_changed();
+    parse_state.canon->tool_offset(parse_state.tool);
 }
 
 void SET_FEED_REFERENCE(double /*reference*/) { }
@@ -866,11 +1112,15 @@ void STRAIGHT_PROBE(int line_number,
                     double a, double b, double c,
                     double u, double v, double w, unsigned char /*probe_type*/) {
     parse_state.pos = {x, y, z, a, b, c, u, v, w};
-    parse_state.canon->straight_probe(line_number,
-            ensure_inch({x, y, z, a, b, c, u, v, w}));
+    flush_position();
+    Point9 p = ensure_inch({x, y, z, a, b, c, u, v, w});
+    parse_state.canon->straight_probe(line_number, p);
+    moved_to(p);
 }
 void RIGID_TAP(int line_number,
                double x, double y, double z, double scale) {
+    // returns to where it started, so the point stays
+    flush_position();
     parse_state.canon->rigid_tap(line_number, ensure_inch(x),
                                  ensure_inch(y),
                                  ensure_inch(z), scale);
@@ -920,6 +1170,12 @@ void GET_EXTERNAL_PARAMETER_FILE_NAME(char *name, int max_size) {
 CANON_UNITS GET_EXTERNAL_LENGTH_UNIT_TYPE() { return CANON_UNITS_INCHES; }
 CANON_TOOL_TABLE GET_EXTERNAL_TOOL_TABLE(int pocket) {
     CANON_TOOL_TABLE tdata = {-1,-1,{{0,0,0},0,0,0,0,0,0},0,0,0,0,{}};
+    // A canon's own get_tool wins; without one, the private table answers.
+    if(!parse_state.has_get_tool && parse_state.private_tool_table) {
+        CANON_TOOL_TABLE got;
+        if(tooldata_get(&got, pocket) == IDX_OK) tdata = got;
+        return tdata;
+    }
     canon_guard([&]{
         py::object result = py::handle(parse_state.callback).attr("get_tool")(pocket);
         if(!PyTuple_Check(result.ptr()) || PyTuple_GET_SIZE(result.ptr()) != 14)
@@ -1001,33 +1257,22 @@ int GET_EXTERNAL_AXIS_MASK() {
     return mask;
 }
 
-double GET_EXTERNAL_TOOL_LENGTH_XOFFSET() {
-    return parse_state.tool_offset.tran.x;
+// The tool offset in effect, in the program's units now - as task's canon
+// answers (TO_PROG_LEN of its tool offset). Not the raw numbers of the last
+// USE_TOOL_LENGTH_OFFSET: those were in the units of whatever program set
+// them, and the next parse's init() reads them as its own, in inches.
+static double tool_length_offset(int axis) {
+    return from_inch(parse_state.tool)[axis];
 }
-double GET_EXTERNAL_TOOL_LENGTH_YOFFSET() {
-    return parse_state.tool_offset.tran.y;
-}
-double GET_EXTERNAL_TOOL_LENGTH_ZOFFSET() {
-    return parse_state.tool_offset.tran.z;
-}
-double GET_EXTERNAL_TOOL_LENGTH_AOFFSET() {
-    return parse_state.tool_offset.a;
-}
-double GET_EXTERNAL_TOOL_LENGTH_BOFFSET() {
-    return parse_state.tool_offset.b;
-}
-double GET_EXTERNAL_TOOL_LENGTH_COFFSET() {
-    return parse_state.tool_offset.c;
-}
-double GET_EXTERNAL_TOOL_LENGTH_UOFFSET() {
-    return parse_state.tool_offset.u;
-}
-double GET_EXTERNAL_TOOL_LENGTH_VOFFSET() {
-    return parse_state.tool_offset.v;
-}
-double GET_EXTERNAL_TOOL_LENGTH_WOFFSET() {
-    return parse_state.tool_offset.w;
-}
+double GET_EXTERNAL_TOOL_LENGTH_XOFFSET() { return tool_length_offset(P9_X); }
+double GET_EXTERNAL_TOOL_LENGTH_YOFFSET() { return tool_length_offset(P9_Y); }
+double GET_EXTERNAL_TOOL_LENGTH_ZOFFSET() { return tool_length_offset(P9_Z); }
+double GET_EXTERNAL_TOOL_LENGTH_AOFFSET() { return tool_length_offset(P9_A); }
+double GET_EXTERNAL_TOOL_LENGTH_BOFFSET() { return tool_length_offset(P9_B); }
+double GET_EXTERNAL_TOOL_LENGTH_COFFSET() { return tool_length_offset(P9_C); }
+double GET_EXTERNAL_TOOL_LENGTH_UOFFSET() { return tool_length_offset(P9_U); }
+double GET_EXTERNAL_TOOL_LENGTH_VOFFSET() { return tool_length_offset(P9_V); }
+double GET_EXTERNAL_TOOL_LENGTH_WOFFSET() { return tool_length_offset(P9_W); }
 
 // The unit constants, answered by the parse's protocol: the callback protocol
 // asks the canon every time, the renderer caches. Before any parse there is
@@ -1127,6 +1372,7 @@ static py::object parse_file(const char *f, py::handle canon,
     // Borrowed for the length of the parse, as it always has been: nothing
     // holds a reference to the canon after this returns.
     parse_state.callback = canon.ptr();
+    parse_state.main_file = f;
 
     // Protocol selection, once, before anything is interpreted: a mode that
     // could flip mid-parse would leave the canon's program half in each
@@ -1136,6 +1382,13 @@ static py::object parse_file(const char *f, py::handle canon,
     // and a failed read has to be visible rather than cleared by the reset
     // below.
     parse_state.interp_error = 0;
+    forget_canon_error();
+    // The optional methods read off any canon, whichever protocol it is on.
+    // Before the interpreter exists: its init() asks for the tool table.
+    parse_state.has_get_tool = canon_defines(canon, "get_tool");
+    parse_state.has_get_tool_change_position =
+            canon_defines(canon, "get_tool_change_position");
+    parse_state.has_source_line = canon_defines(canon, "source_line");
     {
         auto renderer = GCodeRenderer::make(parse_state.callback);
         if(!renderer && PyErr_Occurred()) throw py::error_already_set();
@@ -1143,6 +1396,8 @@ static py::object parse_file(const char *f, py::handle canon,
         else parse_state.canon = std::make_unique<CallbackCanon>();
     }
     parse_state.last_delivered_sequence_number = -1;
+    parse_state.last_delivered_file.clear();
+    parse_state.last_delivered_call_level = -1;
 
     if(parse_state.pinterp) {
         delete parse_state.pinterp;
@@ -1165,13 +1420,40 @@ static py::object parse_file(const char *f, py::handle canon,
     {
         AxisKinds kinds = axisKindsDefault();
         const char *ini_name = getenv("INI_FILE_NAME");
+        parse_state.ini_tool_change_n = 0;
+        parse_state.ini_tool_change = {};
         if(ini_name) {
             linuxcnc::IniFile ini(ini_name);
             std::string err;
             if(ini && axisKindsRead(ini, &kinds, &err)) kinds = axisKindsDefault();
+            // read as task reads it (readToolChange in taskclass.cc): nine,
+            // six or three numbers, anything else is no position
+            if(ini) {
+                if(auto tcp = ini.findString("TOOL_CHANGE_POSITION", "EMCIO")) {
+                    Point9 &t = parse_state.ini_tool_change;
+                    int n = sscanf(tcp->c_str(), "%lf %lf %lf %lf %lf %lf %lf %lf %lf",
+                                   &t[0], &t[1], &t[2], &t[3], &t[4], &t[5],
+                                   &t[6], &t[7], &t[8]);
+                    parse_state.ini_tool_change_n = n == 9 ? 9 : n >= 6 ? 6
+                                                  : n >= 3 ? 3 : 0;
+                }
+            }
         }
         parse_state.angular = kinds.angular;
     }
+
+    // Every parse starts with no point yet and the frame the interpreter's
+    // init() starts from: the offsets it sends again, and the tool offset it
+    // reads back through GET_EXTERNAL_TOOL_LENGTH_* - the last parse's, as a
+    // machine keeps its tool offset from one program to the next - without a
+    // USE_TOOL_LENGTH_OFFSET to say so. `tool` is left as it is for that.
+    parse_state.g5x = {};
+    parse_state.g92 = {};
+    parse_state.rotation_xy = 0;
+    parse_state.frame = WorkFrame();
+    parse_state.plane = static_cast<int>(CANON_PLANE::XY);
+    parse_state.have_point = false;
+    parse_state.position_dirty = false;
 
     parse_state.pos = {};
 
@@ -1190,7 +1472,9 @@ static py::object parse_file(const char *f, py::handle canon,
             if(!code) throw py::error_already_set();
             result = parse_state.pinterp->read(code);
             if(!RESULT_OK) goto out_error;
+            flush_position();
             result = parse_state.pinterp->execute();
+            flush_position();
         }
     }
     if(unitcode && RESULT_OK) {
@@ -1227,8 +1511,12 @@ static py::object parse_file(const char *f, py::handle canon,
             }
         }
         if(!RESULT_OK) break;
+        // read() resyncs after a tool change, probe or home: where that
+        // puts the point belongs to the line just read, ahead of its moves
+        flush_position();
         error_line_offset = 0;
         result = parse_state.pinterp->execute();
+        flush_position();
     }
 out_error:
     if(parse_state.pinterp)
@@ -1241,6 +1529,18 @@ out_error:
         // Hand over what was rendered before the failure: a partial preview is
         // what a partial program has always produced.
         parse_state.canon->finish();
+        // The first error a canon call raised, even if something on the way
+        // here cleared it or raised another.
+        if(parse_state.error_type) {
+            PyErr_Restore(parse_state.error_type, parse_state.error_value,
+                          parse_state.error_traceback);
+            parse_state.error_type = parse_state.error_value =
+                    parse_state.error_traceback = nullptr;
+        }
+        // A method the canon does not have: the AttributeError naming it is
+        // the answer, not a RuntimeError about interp_error.
+        if(PyErr_ExceptionMatches(PyExc_AttributeError))
+            throw py::error_already_set();
         if(!PyErr_Occurred()) {
             PyErr_Format(PyExc_RuntimeError,
                     "interp_error > 0 but no Python exception set");
@@ -1256,6 +1556,7 @@ out_error:
         throw py::error_already_set();
     }
     PyErr_Clear();
+    forget_canon_error();
     maybe_new_line();
     parse_state.canon->finish();
     if(PyErr_Occurred()) { parse_state.interp_error = 1; goto out_error; }
@@ -1460,6 +1761,7 @@ static void load_tool_table(const std::string &path, bool random_toolchanger) {
     }
 
     tooldata_init(random_toolchanger);
+    parse_state.private_tool_table = true;
     if(tooldata_load(path.c_str()))
         throw std::runtime_error("gcode.load_tool_table: cannot load the "
                                  "tool table '" + path + "'");

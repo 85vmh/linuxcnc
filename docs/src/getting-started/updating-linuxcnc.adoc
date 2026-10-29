@@ -378,12 +378,39 @@ the same calls as before:
   through `int()`/`float()` into `#5399`. Without them the interpreter keeps
   the default and `wait` answers 0.
 
+* At an M6, before `change_tool`: `tool_change_move(x, y, z, a, b, c, u, v,
+  w)`, the move task makes to the tool change position. The position is
+  `get_tool_change_position()` when the canon defines it and it answers nine
+  numbers (machine coordinates in machine units, the iocontrol
+  `tool-change-pos-*` pins), else `[EMCIO]TOOL_CHANGE_POSITION`; with
+  neither there is no move. The end point is in the `straight_traverse`
+  frame, with the old tool's offset, and the moves after the M6 start from
+  there. A `gcode.RendererCanon` (AXIS and the other previews) draws it as a
+  traverse.
+* `set_position(x, y, z, a, b, c, u, v, w)` whenever the next move no longer
+  starts at the end of the last one: after G43/G43.1/G43.2/G49, a work offset
+  change (G54-G59.3, G92, G10 L2/L20 on the active system) or the M2 reset.
+* `source_line(filename, line, call_level)` right after each `next_line`: the
+  absolute path of the file the line is in (the main program, a subroutine's
+  or a remap's `.ngc`) and the call depth, 0 in the main program. For such a
+  canon, a line of a subroutine gets its `next_line` even when it has the
+  number of the caller's line.
+
 With no LinuxCNC running there is no tool table, and a T word is an
 interpreter error ("tool not found"). `gcode.load_tool_table(path,
 random_toolchanger=False)` gives the process a private tool table read from a
 `.tbl` file, as `rs274 -t` does. It is process-wide: it replaces the table
 `linuxcnc.stat()` attached to in the same process, though the running
-LinuxCNC's own tool table file is never modified.
+LinuxCNC's own tool table file is never modified. With it loaded, a canon
+needs no `get_tool` (one it defines still wins), and an M6 updates the
+spindle slot as iocontrol does: a non-random toolchanger copies the tool
+into it, a random one swaps it with the tool's pocket, T0 empties it. A G43
+after the M6 and `#5400`-`#5413` then read the new tool.
+
+A method the parse calls on every canon that the canon lacks (`get_tool`
+with no private table, `get_block_delete`, ...) now ends `gcode.parse` with
+the `AttributeError` naming it, rather than a `RuntimeError` about
+`interp_error`.
 
 [WARNING]
 .BREAKING: out-of-tree canons that subclass `rs274.glcanon.GLCanon`

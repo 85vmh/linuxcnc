@@ -28,6 +28,7 @@
 
 #include <array>
 #include <memory>
+#include <string>
 
 #include <emcpos.h>
 
@@ -168,8 +169,8 @@ public:
     virtual void dwell(double seconds) = 0;
     virtual void user_defined_function(int num, double arg1, double arg2) = 0;
     virtual void change_tool(int tool) = 0;
-    // The nine offsets, already in inches; the raw EmcPose stays on
-    // `parse_state.tool_offset` for the GET_EXTERNAL_TOOL_LENGTH_* getters.
+    // The nine offsets, already in inches, which `parse_state.tool` keeps
+    // for the GET_EXTERNAL_TOOL_LENGTH_* getters.
     virtual void tool_offset(const Point9 &offsets) = 0;
 
     // The transform and the modes.
@@ -212,6 +213,18 @@ public:
     virtual void program_end() {}
     virtual void spindle_on(int /*direction*/) {}
     virtual void spindle_off() {}
+    // The move to the tool change position task makes before an M6, the
+    // end point in the straight_traverse frame. Only made for a canon that
+    // wants it: the renderer always (drawn as a traverse, which is what it
+    // is), the callback protocol for a canon with `tool_change_move`.
+    virtual bool wants_tool_change_move() { return true; }
+    virtual void tool_change_move(int line_number, const Point9 &p) {
+        straight_traverse(line_number, p);
+    }
+    // Where the next move starts from, when that is no longer the end of
+    // the last move delivered - a tool or work offset change moved the
+    // program frame under the controlled point. Callback protocol only.
+    virtual void set_position(const Point9 & /*p*/) {}
     // M66, asked of the canon. The defaults are the answers the interpreter
     // has always had here: the input's default value, and 0 (success) from
     // WAIT.
@@ -283,6 +296,10 @@ struct ParseState {
     // nothing but delivery touches either.
     int last_sequence_number = -1;
     int last_delivered_sequence_number = -1;
+    // ... and, for a canon with source_line, the file and call level that
+    // line was in.
+    std::string last_delivered_file;
+    int last_delivered_call_level = -1;
     int selected_tool = 0;
     bool metric = false;
     // A bit per axis that is an angle, X bit 0, from the INI the preview
@@ -293,7 +310,46 @@ struct ParseState {
     // Where the program is, machine units, raw - what the probe/position
     // getters answer with.
     Point9 pos = {};
-    EmcPose tool_offset = {};
+
+    // Whether the canon defines these, read once per parse (see
+    // canon_defines in gcodemodule.cc). get_tool is required unless a
+    // private tool table is loaded.
+    bool has_get_tool = true;
+    bool has_get_tool_change_position = false;
+    bool has_source_line = false;
+    // The program gcode.parse was given, for source_line.
+    std::string main_file;
+    // gcode.load_tool_table gave this process its own table. Process-wide,
+    // so it survives from parse to parse.
+    bool private_tool_table = false;
+
+    // The program frame as task's canon keeps it, everything in inches:
+    // machine = g5x + Rz(rotation_xy) * (g92 + frame(program)) + tool.
+    Point9 g5x = {};
+    Point9 g92 = {};
+    double rotation_xy = 0;
+    WorkFrame frame;
+    Point9 tool = {};
+    int plane = 1;                      // CANON_PLANE::XY
+    // [EMCIO]TOOL_CHANGE_POSITION, machine units, and how many of the nine
+    // the INI gave (0, 3, 6 or 9).
+    Point9 ini_tool_change = {};
+    int ini_tool_change_n = 0;
+    // The end of the last move delivered: in the straight_traverse frame as
+    // the canon was told it, and where that put the machine. Until the
+    // first move there is no point to report a change of.
+    bool have_point = false;
+    Point9 point = {};
+    Point9 machine = {};
+    // An offset changed since the point was last checked.
+    bool position_dirty = false;
+
+    // The first Python error a canon call raised in this parse, kept so an
+    // error cleared on the way out (or overwritten) still reaches the
+    // caller. New references, or null.
+    PyObject *error_type = nullptr;
+    PyObject *error_value = nullptr;
+    PyObject *error_traceback = nullptr;
 
     // The line number for a canon event that is not given one.
     int current_line() const;
@@ -308,6 +364,10 @@ struct ParseState {
 
 extern ParseState parse_state;
 
+// Keep the error just set as the parse's first, unless one is kept already.
+// Defined in gcodemodule.cc.
+void remember_canon_error();
+
 // Run one canon-side step that touches Python. A failure becomes
 // `interp_error++` with the Python error left set, which is the protocol
 // above; nothing may leave as a C++ exception, because these run from inside
@@ -320,12 +380,15 @@ static inline void canon_guard(F &&body) {
         body();
     } catch(pybind11::error_already_set &e) {
         e.restore();                    // the error stays set, as it was
+        remember_canon_error();
         parse_state.interp_error ++;
     } catch(pybind11::builtin_exception &e) {
         e.set_error();                  // py::type_error and friends, by kind
+        remember_canon_error();
         parse_state.interp_error ++;
     } catch(const std::exception &e) {
         PyErr_SetString(PyExc_RuntimeError, e.what());
+        remember_canon_error();
         parse_state.interp_error ++;
     }
 }
