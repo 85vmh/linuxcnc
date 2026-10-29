@@ -182,11 +182,13 @@ public:
     virtual void set_plane(int plane) = 0;
     virtual void set_feed_rate(double rate) = 0;
     virtual void set_traverse_rate(double rate) = 0;
-    // Only the renderer listens: SET_SPINDLE_SPEED has never forwarded a
-    // callback, so the callback protocol has nothing to do here.
-    virtual void set_spindle_speed(double /*rpm*/) {}
-    // What a time estimate needs and nothing else reads. Renderer only; the
-    // callback protocol has never forwarded any of them.
+    // Spindle 0's S word as the interpreter passes it: rpm under G97, the
+    // surface speed under G96 (feet/min under G20, metres/min under G21).
+    // The renderer reads it for its time estimate; the callback protocol
+    // forwards it to a canon that has `set_spindle_speed`.
+    virtual void set_spindle_speed(double /*speed*/) {}
+    // What a time estimate needs; the callback protocol forwards each to a
+    // canon that has the method of the same name.
     //   per_rev        1 under G95, 0 under G93 and G94 - G93 is G94 here,
     //                  the interpreter having already made its F a units/min
     //                  rate per move (interp_inverse.cc).
@@ -195,6 +197,28 @@ public:
     virtual void set_feed_mode(int /*per_rev*/) {}
     virtual void set_spindle_mode(double /*css_max*/) {}
     virtual void set_spindle_sync(double /*units_per_rev*/) {}
+
+    // Events a program simulator needs and a preview does not. Only the
+    // callback protocol listens, and only to a canon that has the method:
+    // one without it sees exactly the sequence it saw before these existed.
+    //   program_stop           M0 and M60
+    //   optional_program_stop  M1, always - the canon decides whether the
+    //                          optional-stop switch is on
+    //   program_end            M2 and M30
+    //   spindle_on             spindle 0 starting, 1 for M3, -1 for M4
+    //   spindle_off            spindle 0 stopping
+    virtual void program_stop() {}
+    virtual void optional_program_stop() {}
+    virtual void program_end() {}
+    virtual void spindle_on(int /*direction*/) {}
+    virtual void spindle_off() {}
+    // M66, asked of the canon. The defaults are the answers the interpreter
+    // has always had here: the input's default value, and 0 (success) from
+    // WAIT.
+    virtual int digital_input(int /*index*/, int def) { return def; }
+    virtual double analog_input(int /*index*/, double def) { return def; }
+    virtual int wait_input(int /*index*/, int /*input_type*/,
+                           int /*wait_type*/, double /*timeout*/) { return 0; }
     // A comment, *after* the canon has had it - COMMENT forwards first for
     // both protocols and dispatches here only when the forward succeeded, so
     // `(AXIS,stop)` still stops the parse before the word after it could open

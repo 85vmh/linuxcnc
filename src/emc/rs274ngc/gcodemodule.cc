@@ -49,14 +49,19 @@
 #include <structmember.h>
 
 #include <chrono>
+#include <errno.h>
 #include <float.h>
 #include <memory>
+#include <stdlib.h>
+#include <string.h>
 #include <tuple>
+#include <unistd.h>
 
 #include "rs274ngc.hh"
 #include "rs274ngc_interp.hh"
 #include "nml_intf/interp_return.hh"
 #include "nml_intf/canon.hh"
+#include "tooldata/tooldata.hh"
 #include <axis_kinds.hh>
 
 int _task = 0; // control preview behaviour when remapping
@@ -303,11 +308,50 @@ static void forward9(const char *method, int index, const Point9 &p) {
     std::apply([&](auto... c) { forward(method, index, c...); }, p);
 }
 
+// Whether the canon defines `name`: on its class (and so its bases) or set on
+// the instance itself. Deliberately not hasattr(): a canon with a catch-all
+// __getattr__ - several tests and out-of-tree canons stub every callback that
+// way - would claim every optional event and start getting calls, and None
+// answers to M66, it never asked for.
+static bool canon_defines(py::handle cb, const char *name) {
+    if(PyObject_HasAttrString(reinterpret_cast<PyObject *>(Py_TYPE(cb.ptr())), name))
+        return true;
+    // The instance's own dict, if it has a real one; anything else (no dict,
+    // or a catch-all answering for __dict__ too) defines nothing here.
+    PyObject *dict = PyObject_GetAttrString(cb.ptr(), "__dict__");
+    if(!dict) { PyErr_Clear(); return false; }
+    bool found = PyDict_Check(dict) && PyDict_GetItemString(dict, name);
+    Py_DECREF(dict);
+    return found;
+}
+
 // The per-event callback protocol: each canon event becomes one Python call,
 // preceded by at most one next_line per source line - byte-for-byte the
 // sequence this module has always produced.
+//
+// The events added for program simulators (stops, spindle, feed modes, M66)
+// are optional: each is looked up once, when the protocol is made at the
+// start of a parse (see canon_defines), and a canon without the method gets
+// neither the call nor the next_line it would have brought - the sequence it
+// always had.
 class CallbackCanon final : public Canon {
 public:
+    CallbackCanon() {
+        py::handle cb(parse_state.callback);
+        has_program_stop_ = canon_defines(cb, "program_stop");
+        has_optional_program_stop_ = canon_defines(cb, "optional_program_stop");
+        has_program_end_ = canon_defines(cb, "program_end");
+        has_spindle_on_ = canon_defines(cb, "spindle_on");
+        has_spindle_off_ = canon_defines(cb, "spindle_off");
+        has_set_spindle_speed_ = canon_defines(cb, "set_spindle_speed");
+        has_set_spindle_mode_ = canon_defines(cb, "set_spindle_mode");
+        has_set_feed_mode_ = canon_defines(cb, "set_feed_mode");
+        has_set_spindle_sync_ = canon_defines(cb, "set_spindle_sync");
+        has_get_digital_input_ = canon_defines(cb, "get_digital_input");
+        has_get_analog_input_ = canon_defines(cb, "get_analog_input");
+        has_wait_ = canon_defines(cb, "wait");
+    }
+
     void arc_feed(int line_number, double first_end, double second_end,
                   double first_axis, double second_axis, int rotation,
                   double axis_end_point, double a, double b, double c,
@@ -381,6 +425,85 @@ public:
         maybe_new_line();
         forward("set_traverse_rate", rate);
     }
+    void program_stop() override {
+        if(!has_program_stop_) return;
+        maybe_new_line();
+        forward("program_stop");
+    }
+    void optional_program_stop() override {
+        if(!has_optional_program_stop_) return;
+        maybe_new_line();
+        forward("optional_program_stop");
+    }
+    void program_end() override {
+        if(!has_program_end_) return;
+        maybe_new_line();
+        forward("program_end");
+    }
+    void spindle_on(int direction) override {
+        if(!has_spindle_on_) return;
+        maybe_new_line();
+        forward("spindle_on", direction);
+    }
+    void spindle_off() override {
+        if(!has_spindle_off_) return;
+        maybe_new_line();
+        forward("spindle_off");
+    }
+    void set_spindle_speed(double speed) override {
+        if(!has_set_spindle_speed_) return;
+        maybe_new_line();
+        forward("set_spindle_speed", speed);
+    }
+    void set_spindle_mode(double css_max) override {
+        if(!has_set_spindle_mode_) return;
+        maybe_new_line();
+        forward("set_spindle_mode", css_max);
+    }
+    void set_feed_mode(int per_rev) override {
+        if(!has_set_feed_mode_) return;
+        maybe_new_line();
+        forward("set_feed_mode", per_rev);
+    }
+    void set_spindle_sync(double units_per_rev) override {
+        if(!has_set_spindle_sync_) return;
+        maybe_new_line();
+        forward("set_spindle_sync", units_per_rev);
+    }
+    // The answers go through int() and float(), as a Python caller would
+    // convert them; a failed call or conversion ends the parse like any
+    // other callback, and the interpreter gets the default meanwhile.
+    int digital_input(int index, int def) override {
+        if(!has_get_digital_input_) return def;
+        maybe_new_line();
+        int result = def;
+        canon_guard([&]{
+            result = py::int_(py::handle(parse_state.callback)
+                    .attr("get_digital_input")(index, def)).cast<int>();
+        });
+        return result;
+    }
+    double analog_input(int index, double def) override {
+        if(!has_get_analog_input_) return def;
+        maybe_new_line();
+        double result = def;
+        canon_guard([&]{
+            result = py::float_(py::handle(parse_state.callback)
+                    .attr("get_analog_input")(index, def)).cast<double>();
+        });
+        return result;
+    }
+    int wait_input(int index, int input_type, int wait_type,
+                   double timeout) override {
+        if(!has_wait_) return 0;
+        maybe_new_line();
+        int result = 0;
+        canon_guard([&]{
+            result = py::int_(py::handle(parse_state.callback)
+                    .attr("wait")(index, input_type, wait_type, timeout)).cast<int>();
+        });
+        return result;
+    }
     // Asked every time, uncached: a canon on this protocol was going to be
     // called per event anyway, and one may legitimately watch the traffic.
     double external_length_units() override {
@@ -389,6 +512,20 @@ public:
     double external_angle_units() override {
         return read_external_angle_units();
     }
+
+private:
+    bool has_program_stop_ = false;
+    bool has_optional_program_stop_ = false;
+    bool has_program_end_ = false;
+    bool has_spindle_on_ = false;
+    bool has_spindle_off_ = false;
+    bool has_set_spindle_speed_ = false;
+    bool has_set_spindle_mode_ = false;
+    bool has_set_feed_mode_ = false;
+    bool has_set_spindle_sync_ = false;
+    bool has_get_digital_input_ = false;
+    bool has_get_analog_input_ = false;
+    bool has_wait_ = false;
 };
 
 // The interpreter works in the program's own units; every canon method below
@@ -650,26 +787,33 @@ void START_SPEED_FEED_SYNCH(int /*spindle*/, double sync, bool /*vel*/, double /
 void STOP_SPEED_FEED_SYNCH() {
     parse_state.canon->set_spindle_sync(0.0);
 }
-void START_SPINDLE_COUNTERCLOCKWISE(int /*spindle*/, int /*wait_for_at_speed*/) {}
-void START_SPINDLE_CLOCKWISE(int /*spindle*/, int /*wait_for_at_speed*/) {}
+// Spindle 0 only, as SET_SPINDLE_SPEED below.
+void START_SPINDLE_COUNTERCLOCKWISE(int spindle, int /*wait_for_at_speed*/) {
+    if(spindle == 0) parse_state.canon->spindle_on(-1);
+}
+void START_SPINDLE_CLOCKWISE(int spindle, int /*wait_for_at_speed*/) {
+    if(spindle == 0) parse_state.canon->spindle_on(1);
+}
 void SET_SPINDLE_MODE(int spindle, double css_max) {
     if(spindle == 0) parse_state.canon->set_spindle_mode(css_max);
 }
-void STOP_SPINDLE_TURNING(int /*spindle*/, int /*wait_for_at_speed*/) {}
+void STOP_SPINDLE_TURNING(int spindle, int /*wait_for_at_speed*/) {
+    if(spindle == 0) parse_state.canon->spindle_off();
+}
 void SET_SPINDLE_SPEED(int spindle, double rpm) {
     if(spindle == 0) parse_state.canon->set_spindle_speed(rpm);
 }
 void ORIENT_SPINDLE(int /*spindle*/, double /*d*/, int /*i*/) {}
 void WAIT_SPINDLE_ORIENT_COMPLETE(int /*s*/, double /*timeout*/) {}
-void PROGRAM_STOP() {}
-void PROGRAM_END() {}
+void PROGRAM_STOP() { parse_state.canon->program_stop(); }
+void PROGRAM_END() { parse_state.canon->program_end(); }
 void FINISH() {}
 void ON_RESET() {}
 void PALLET_SHUTTLE() {}
 void SELECT_TOOL(int tool) {parse_state.selected_tool = tool;}
 void UPDATE_TAG(const StateTag& /*tag*/) {}
 void SELECT_KINS_TYPE(int /*switchkins_type*/) {}
-void OPTIONAL_PROGRAM_STOP() {}
+void OPTIONAL_PROGRAM_STOP() { parse_state.canon->optional_program_stop(); }
 int  GET_EXTERNAL_TC_FAULT() {return 0;}
 int  GET_EXTERNAL_TC_REASON() {return 0;}
 
@@ -803,9 +947,19 @@ CANON_TOOL_TABLE GET_EXTERNAL_TOOL_TABLE(int pocket) {
     return tdata;
 }
 
-int GET_EXTERNAL_DIGITAL_INPUT(int /*index*/, int def) { return def; }
-double GET_EXTERNAL_ANALOG_INPUT(int /*index*/, double def) { return def; }
-int WAIT(int /*index*/, int /*input_type*/, int /*wait_type*/, double /*timeout*/) { return 0;}
+// M66: the canon's answer when it has one, the defaults otherwise.
+int GET_EXTERNAL_DIGITAL_INPUT(int index, int def) {
+    if(!parse_state.canon) return def;
+    return parse_state.canon->digital_input(index, def);
+}
+double GET_EXTERNAL_ANALOG_INPUT(int index, double def) {
+    if(!parse_state.canon) return def;
+    return parse_state.canon->analog_input(index, def);
+}
+int WAIT(int index, int input_type, int wait_type, double timeout) {
+    if(!parse_state.canon) return 0;
+    return parse_state.canon->wait_input(index, input_type, wait_type, timeout);
+}
 
 static void user_defined_function(int num, double arg1, double arg2) {
     if(parse_state.interp_error) return;
@@ -1261,6 +1415,56 @@ static py::list rs274_arc_to_segments(py::handle canon,
     return segs;
 }
 
+// A private tool table for this process, read from a .tbl file - what
+// `rs274 -t` does (sai/driver.cc): its own mmap file, created with mkstemp()
+// so the name cannot be pre-placed, and unlinked at exit. Process-wide, as
+// the tooldata mmap is: it replaces whatever this process had mapped,
+// including a running LinuxCNC's table that linuxcnc.stat() attached to -
+// that one is only unmapped, never truncated or unlinked, since
+// tool_mmap_close() removes the file only for the process that created it.
+static void load_tool_table(const std::string &path, bool random_toolchanger) {
+    // Checked before anything is dropped, so a bad path leaves the table
+    // this process had.
+    FILE *fp = fopen(path.c_str(), "r");
+    if(!fp) {
+        PyErr_SetFromErrnoWithFilename(PyExc_OSError, path.c_str());
+        throw py::error_already_set();
+    }
+    fclose(fp);
+
+    // Ours from an earlier call is unlinked here; one attached to a running
+    // LinuxCNC is only unmapped. Before the new name is set: close unlinks
+    // by the current name.
+    tool_mmap_close();
+
+    char fname[LINELEN];
+    const char *tmpdir = getenv("TMPDIR");
+    if(!tmpdir || !*tmpdir) tmpdir = "/tmp";
+    snprintf(fname, sizeof(fname), "%s/gcode.tool.mmap.XXXXXX", tmpdir);
+    int fd = mkstemp(fname);
+    if(fd < 0)
+        throw std::runtime_error(std::string("gcode.load_tool_table: "
+                "cannot create the tool mmap file: ") + strerror(errno));
+    close(fd);   // tool_mmap_creator_try() opens it by name, O_NOFOLLOW
+
+    tool_mmap_set_fname(fname);
+    char why[LINELEN] = {};
+    if(tool_mmap_creator_try(nullptr, random_toolchanger, why, sizeof(why))) {
+        unlink(fname);
+        throw std::runtime_error(std::string("gcode.load_tool_table: ") + why);
+    }
+    static bool atexit_registered = false;
+    if(!atexit_registered) {
+        atexit(tool_mmap_close);   // unlinks the file this process created
+        atexit_registered = true;
+    }
+
+    tooldata_init(random_toolchanger);
+    if(tooldata_load(path.c_str()))
+        throw std::runtime_error("gcode.load_tool_table: cannot load the "
+                                 "tool table '" + path + "'");
+}
+
 PYBIND11_MODULE(gcode, m) {
     m.doc() = "Interface to EMC rs274ngc interpreter";
 
@@ -1289,6 +1493,14 @@ PYBIND11_MODULE(gcode, m) {
             py::arg("interpname") = py::none(),
             "Parse a G-Code file");
 
+    m.def("load_tool_table", &load_tool_table,
+            py::arg("path"), py::arg("random_toolchanger") = false,
+            "Give this process a private tool table read from a .tbl file,\n"
+            "for parsing T words with no LinuxCNC running - what rs274 -t\n"
+            "does. Calling it again replaces the table. Process-wide: it\n"
+            "replaces the table linuxcnc.stat() attached to in this process,\n"
+            "though the running LinuxCNC's own file is never touched.\n"
+            "Raises OSError or RuntimeError with the reason on failure.");
     m.def("strerror", &rs274_strerror, py::arg("error"),
             "Convert a numeric error to a string");
     m.def("calc_extents", &rs274_calc_extents,

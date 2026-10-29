@@ -357,6 +357,34 @@ on pybind11; its functions keep their names and signatures. One behaviour
 change: `gcode.linecode()` snapshots the running parse, and raises
 `ValueError` when no parse is in progress.
 
+A per-event canon can also opt into the events a program simulator needs, by
+defining the methods on its class (a catch-all `__getattr__` does not count).
+Each is delivered in order with the moves, after `next_line` for its line;
+lengths are in inches, like every other callback. A canon without them sees
+the same calls as before:
+
+* `program_stop()` (M0, M60), `optional_program_stop()` (M1, always: the canon
+  decides whether the optional-stop switch is on), `program_end()` (M2, M30).
+* `spindle_on(direction)` (1 for M3, -1 for M4) and `spindle_off()`, spindle 0
+  only.
+* `set_spindle_speed(s)`: the S word as given, rpm under G97 and the surface
+  speed under G96 (feet/min under G20, metres/min under G21).
+  `set_spindle_mode(css_max)`: 0 under G97, the D word under G96, 1e30 for G96
+  without D. `set_feed_mode(per_rev)`: 1 under G95, else 0.
+  `set_spindle_sync(units_per_rev)`: the G33/G33.1/G76 pitch in inches, 0 when
+  it ends.
+* M66 asks `get_digital_input(index, default)`, `get_analog_input(index,
+  default)` and `wait(index, input_type, wait_type, timeout)`; the answer goes
+  through `int()`/`float()` into `#5399`. Without them the interpreter keeps
+  the default and `wait` answers 0.
+
+With no LinuxCNC running there is no tool table, and a T word is an
+interpreter error ("tool not found"). `gcode.load_tool_table(path,
+random_toolchanger=False)` gives the process a private tool table read from a
+`.tbl` file, as `rs274 -t` does. It is process-wide: it replaces the table
+`linuxcnc.stat()` attached to in the same process, though the running
+LinuxCNC's own tool table file is never modified.
+
 [WARNING]
 .BREAKING: out-of-tree canons that subclass `rs274.glcanon.GLCanon`
 ====
