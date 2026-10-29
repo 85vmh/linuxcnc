@@ -115,6 +115,9 @@ public:
 
 // return the current sequence number (how many lines read)
  int sequence_number() override;
+ // the line the executing code is on, sequence_number save inside a remap's
+ // controlling block, where it is the remapped line's
+ int source_line_number();
 
 // copy the function name from the stack_index'th position of the
 // function call stack at the time of the most recent error into
