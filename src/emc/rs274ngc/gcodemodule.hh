@@ -317,6 +317,10 @@ struct ParseState {
     bool has_get_tool = true;
     bool has_get_tool_change_position = false;
     bool has_source_line = false;
+    // The machine's state at cycle start, asked once before the program.
+    bool has_get_initial_position = false;
+    bool has_get_tool_in_spindle = false;
+    bool has_get_tool_offset = false;
     // The program gcode.parse was given, for source_line.
     std::string main_file;
     // gcode.load_tool_table gave this process its own table. Process-wide,

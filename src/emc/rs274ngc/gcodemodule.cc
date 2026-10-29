@@ -245,8 +245,19 @@ static void forget_canon_error() {
     Py_CLEAR(parse_state.error_traceback);
 }
 
+// The line the interpreter is executing, as the program numbers it. While a
+// remap runs in the context of the block that triggered it, the interpreter's
+// sequence_number is 0 (enter_remap() parks the real one); what the remap
+// does belongs to the remapped line, which source_line_number() gives.
+static int interp_line(int sequence_number) {
+    Interp *interp = dynamic_cast<Interp *>(parse_state.pinterp);
+    if(!interp || sequence_number != interp->sequence_number())
+        return sequence_number;
+    return interp->source_line_number();
+}
+
 int ParseState::current_line() const {
-    return pinterp ? pinterp->sequence_number() : last_sequence_number;
+    return pinterp ? interp_line(pinterp->sequence_number()) : last_sequence_number;
 }
 
 static void maybe_new_line(int sequence_number);
@@ -321,12 +332,12 @@ static void maybe_new_line(int sequence_number) {
     // very little still forwards, so the periodic report in the parse loop is
     // what actually bounds how stale a progress bar gets.
     parse_state.canon->progress();
-    deliver_new_line(sequence_number);
+    deliver_new_line(interp_line(sequence_number));
 }
 
 static void maybe_new_line() {
     if(!parse_state.pinterp) return;
-    maybe_new_line(parse_state.pinterp->sequence_number());
+    maybe_new_line(parse_state.current_line());
 }
 
 // An exact type check, not py::cast: these two reject an int where a float is
@@ -384,6 +395,186 @@ static bool canon_defines(py::handle cb, const char *name) {
     return found;
 }
 
+// The time estimate of the callback protocol, for a canon that defines
+// machine_limits() and set_move_times(): a TimeEstimator fed exactly as
+// GCodeRenderer feeds its own - the same frame (the transform without the
+// tool offset, which the estimator rebases across instead), the same feed
+// and spindle state, the untimed first traverse, (AXIS,hide) spans left
+// untimed, arcs cut by arc_segments() at the canon's arcdivision - so the
+// last time it reports is the renderer's total for the same program. One
+// entry per timed event the canon was handed, in order; an event that took
+// no time (or was not timed) repeats the time before it.
+class CallbackTimer {
+public:
+    CallbackTimer(const MachineLimits &limits, int arcdivision)
+        : est_(limits), tool_change_seconds_(limits.tool_change_seconds),
+          arcdivision_(arcdivision) {
+        est_.record_events(&times_);
+    }
+
+    void set_feed_rate(double rate) { rate_ = rate; }
+    // as GCodeRenderer::set_spindle_speed: the CSS factor out of the units
+    // in force at the S word
+    void set_spindle_speed(double speed) {
+        speed_ = speed;
+        css_factor_ = (parse_state.metric ? 1000.0 / 25.4 : 12.0)
+                / (2 * M_PI) * speed;
+    }
+    void set_feed_mode(int per_rev) { per_rev_ = per_rev != 0; }
+    void set_spindle_mode(double css_max) { css_max_ = css_max; }
+    void set_spindle_sync(double pitch) { sync_pitch_ = pitch; est_.stop(); }
+    void comment(const char *text) {
+        const char *rest;
+        if(!strncmp(text, "AXIS,", 5)) rest = text + 5;
+        else if(!strncmp(text, "PREVIEW,", 8)) rest = text + 8;
+        else return;
+        if(strcspn(rest, ",") != 4) return;
+        if(!strncmp(rest, "hide", 4)) suppress_ ++;
+        else if(!strncmp(rest, "show", 4)) suppress_ --;
+    }
+    void tool_offset(const Point9 &o) {
+        lo_ = lo_ - o + tool_;
+        tool_ = o;
+    }
+    void user_defined_function() { if(suppress_ <= 0) est_.stop(); }
+
+    enum Kind { Traverse, Feed, Probe };
+    void move(Kind kind, int line, const Point9 &in) {
+        int ev = new_event();
+        if(suppress_ > 0) return;
+        est_.mark(ev);
+        Point9 p;
+        transform(in, p);
+        FeedState fs = feed_state();
+        bool timed = true;
+        if(first_) {
+            // the caller's `G53 G0 <where the machine is>` initcode
+            first_ = false;
+            if(kind == Traverse) timed = false;
+        }
+        if(!timed) ;
+        else if(kind == Traverse) est_.traverse(line, lo_, p, fs);
+        else if(kind == Probe) est_.probe(line, lo_, p, fs, lo_x_, in[P9_X]);
+        else est_.feed(line, lo_, p, fs, lo_x_, in[P9_X], 0.0);
+        lo_ = p;
+        lo_x_ = in[P9_X];
+        est_.mark(-1);
+    }
+    // In to the point and back out: two entries.
+    void rigid_tap(int line, double x, double y, double z, double scale) {
+        int in = new_event(), out = new_event();
+        if(suppress_ > 0) return;
+        Point9 p;
+        transform({x, y, z}, p);
+        Point9 end = lo_;
+        end[P9_X] = p[P9_X]; end[P9_Y] = p[P9_Y]; end[P9_Z] = p[P9_Z];
+        est_.mark(in, out);
+        est_.rigid_tap(line, lo_, end, feed_state(), scale);
+        est_.mark(-1);
+    }
+    void arc(int line, double first_end, double second_end, double first_axis,
+             double second_axis, int rotation, double axis_end_point,
+             double a, double b, double c, double u, double v, double w) {
+        int ev = new_event();
+        if(suppress_ > 0) return;
+        double radius = 0.0;
+        double rad = parse_state.rotation_xy * (M_PI / 180.0);
+        arc_segments(lo_, parse_state.plane, cos(rad), sin(rad),
+                     parse_state.g5x, parse_state.g92, parse_state.frame,
+                     first_end, second_end, first_axis, second_axis, rotation,
+                     axis_end_point, a, b, c, u, v, w,
+                     arcdivision_, segs_, &radius);
+        first_ = false;
+        est_.mark(ev);
+        FeedState fs = feed_state();
+        for(const Point9 &q : segs_) {
+            double prog_x = untransform_x(q);
+            est_.feed(line, lo_, q, fs, lo_x_, prog_x, radius);
+            lo_ = q;
+            lo_x_ = prog_x;
+        }
+        est_.mark(-1);
+    }
+    void dwell(int line, double seconds) {
+        int ev = new_event();
+        if(suppress_ > 0) return;
+        est_.mark(ev);
+        est_.fixed(line, seconds);
+        est_.mark(-1);
+    }
+    void change_tool(int line) {
+        est_.mark(new_event());
+        est_.fixed(line, tool_change_seconds_);
+        est_.mark(-1);
+    }
+
+    // The cumulative times, every entry filled, and what was not modelled.
+    std::vector<double> finish(std::vector<std::string> &flags) {
+        est_.finish();
+        double last = 0.0;
+        for(double &t : times_) {
+            if(std::isnan(t)) t = last;
+            else last = t;
+        }
+        flags = est_.flags();
+        return times_;
+    }
+
+private:
+    int new_event() {
+        times_.push_back(NAN);
+        return (int)times_.size() - 1;
+    }
+    FeedState feed_state() const {
+        FeedState fs;
+        fs.rate = rate_;
+        fs.per_rev = per_rev_;
+        fs.sync_pitch = sync_pitch_;
+        fs.rpm = speed_;
+        fs.css_max = css_max_;
+        fs.css_factor = css_factor_;
+        fs.metric = parse_state.metric;
+        return fs;
+    }
+    // GCodeRenderer::transform, off the frame the module keeps
+    static void transform(const Point9 &in, Point9 &out) {
+        out = in;
+        parse_state.frame.apply(out);
+        out += parse_state.g92;
+        if(parse_state.rotation_xy != 0.0) {
+            double rad = parse_state.rotation_xy * (M_PI / 180.0);
+            double c = cos(rad), sn = sin(rad);
+            double rotx = out[P9_X] * c - out[P9_Y] * sn;
+            out[P9_Y] = out[P9_X] * sn + out[P9_Y] * c;
+            out[P9_X] = rotx;
+        }
+        out += parse_state.g5x;
+    }
+    // ... and GCodeRenderer::untransform's X, the CSS radius of a segment
+    static double untransform_x(const Point9 &in) {
+        Point9 out = in - parse_state.g5x;
+        if(parse_state.rotation_xy != 0.0) {
+            double rad = parse_state.rotation_xy * (M_PI / 180.0);
+            double c = cos(rad), sn = -sin(rad);
+            out[P9_X] = out[P9_X] * c - out[P9_Y] * sn;
+        }
+        return out[P9_X] - parse_state.g92[P9_X];
+    }
+
+    TimeEstimator est_;
+    std::vector<double> times_;
+    double tool_change_seconds_;
+    int arcdivision_;
+    std::vector<Point9> segs_;
+    double rate_ = 0.0, speed_ = 0.0, css_max_ = 0.0, css_factor_ = 0.0;
+    double sync_pitch_ = 0.0;
+    bool per_rev_ = false;
+    int suppress_ = 0;
+    bool first_ = true;
+    Point9 lo_ = {}, tool_ = {};
+    double lo_x_ = 0.0;
+};
+
 // The per-event callback protocol: each canon event becomes one Python call,
 // preceded by at most one next_line per source line - byte-for-byte the
 // sequence this module has always produced.
@@ -411,6 +602,8 @@ public:
         has_wait_ = canon_defines(cb, "wait");
         has_tool_change_move_ = canon_defines(cb, "tool_change_move");
         has_set_position_ = canon_defines(cb, "set_position");
+        if(canon_defines(cb, "machine_limits") && canon_defines(cb, "set_move_times"))
+            make_timer();
     }
 
     void arc_feed(int line_number, double first_end, double second_end,
@@ -420,40 +613,51 @@ public:
         maybe_new_line(line_number);
         forward("arc_feed", first_end, second_end, first_axis, second_axis,
                 rotation, axis_end_point, a, b, c, u, v, w);
+        if(timed()) timer_->arc(line_number, first_end, second_end, first_axis,
+                                second_axis, rotation, axis_end_point,
+                                a, b, c, u, v, w);
     }
     void straight_feed(int line_number, const Point9 &p) override {
         maybe_new_line(line_number);
         forward9("straight_feed", p);
+        if(timed()) timer_->move(CallbackTimer::Feed, line_number, p);
     }
     void straight_traverse(int line_number, const Point9 &p) override {
         maybe_new_line(line_number);
         forward9("straight_traverse", p);
+        if(timed()) timer_->move(CallbackTimer::Traverse, line_number, p);
     }
     void straight_probe(int line_number, const Point9 &p) override {
         maybe_new_line(line_number);
         forward9("straight_probe", p);
+        if(timed()) timer_->move(CallbackTimer::Probe, line_number, p);
     }
     // The retract multiplier is dropped: the callback takes three arguments.
     void rigid_tap(int line_number, double x, double y, double z,
-                   double /*retract_scale*/) override {
+                   double retract_scale) override {
         maybe_new_line(line_number);
         forward("rigid_tap", x, y, z);
+        if(timed()) timer_->rigid_tap(line_number, x, y, z, retract_scale);
     }
     void dwell(double seconds) override {
         maybe_new_line();
         forward("dwell", seconds);
+        if(timed()) timer_->dwell(parse_state.current_line(), seconds);
     }
     void user_defined_function(int num, double arg1, double arg2) override {
         maybe_new_line();
         forward("user_defined_function", num, arg1, arg2);
+        if(timed()) timer_->user_defined_function();
     }
     void change_tool(int tool) override {
         maybe_new_line();
         forward("change_tool", tool);
+        if(timed()) timer_->change_tool(parse_state.current_line());
     }
     void tool_offset(const Point9 &o) override {
         maybe_new_line();
         forward9("tool_offset", o);
+        if(timer_) timer_->tool_offset(o);
     }
     void set_g5x_offset(int index, const Point9 &o) override {
         maybe_new_line();
@@ -481,6 +685,11 @@ public:
     void set_feed_rate(double rate) override {
         maybe_new_line();
         forward("set_feed_rate", rate);
+        if(timer_) timer_->set_feed_rate(rate);
+    }
+    // the timer's (AXIS,hide) depth, after the canon has had the comment
+    void comment(const char *text) override {
+        if(timer_) timer_->comment(text);
     }
     void set_traverse_rate(double rate) override {
         maybe_new_line();
@@ -490,6 +699,7 @@ public:
     void tool_change_move(int line_number, const Point9 &p) override {
         maybe_new_line(line_number);
         forward9("tool_change_move", p);
+        if(timed()) timer_->move(CallbackTimer::Traverse, line_number, p);
     }
     void set_position(const Point9 &p) override {
         if(!has_set_position_) return;
@@ -522,21 +732,25 @@ public:
         forward("spindle_off");
     }
     void set_spindle_speed(double speed) override {
+        if(timer_) timer_->set_spindle_speed(speed);
         if(!has_set_spindle_speed_) return;
         maybe_new_line();
         forward("set_spindle_speed", speed);
     }
     void set_spindle_mode(double css_max) override {
+        if(timer_) timer_->set_spindle_mode(css_max);
         if(!has_set_spindle_mode_) return;
         maybe_new_line();
         forward("set_spindle_mode", css_max);
     }
     void set_feed_mode(int per_rev) override {
+        if(timer_) timer_->set_feed_mode(per_rev);
         if(!has_set_feed_mode_) return;
         maybe_new_line();
         forward("set_feed_mode", per_rev);
     }
     void set_spindle_sync(double units_per_rev) override {
+        if(timer_) timer_->set_spindle_sync(units_per_rev);
         if(!has_set_spindle_sync_) return;
         maybe_new_line();
         forward("set_spindle_sync", units_per_rev);
@@ -584,7 +798,54 @@ public:
         return read_external_angle_units();
     }
 
+    // The estimate, handed over once the parse is done.
+    void finish() override {
+        if(!timer_ || parse_state.interp_error) return;
+        std::vector<std::string> flags;
+        std::vector<double> times = timer_->finish(flags);
+        timer_.reset();
+        canon_guard([&]{
+            py::list seq(times.size());
+            for(size_t i = 0; i < times.size(); i++) seq[i] = times[i];
+            py::handle(parse_state.callback).attr("set_move_times")(seq);
+            if(!flags.empty()) {
+                py::list f;
+                for(const std::string &name : flags) f.append(name);
+                py::handle(parse_state.callback).attr("set_time_flags")(f);
+            }
+        });
+    }
+
 private:
+    // A timed event the canon was handed: one that reached it.
+    bool timed() const { return timer_ && !parse_state.interp_error; }
+
+    // machine_limits(), read as the renderer reads it; None or limits that
+    // time nothing leave the parse untimed.
+    void make_timer() {
+        canon_guard([&]{
+            py::handle cb(parse_state.callback);
+            py::object ml = cb.attr("machine_limits")();
+            if(ml.is_none()) return;
+            double scale = 25.4 * read_external_length_units();
+            if(parse_state.interp_error) return;
+            if(!(scale > 0.0))
+                throw py::value_error("machine_limits: the canon's length "
+                                      "units are zero");
+            MachineLimits limits = machine_limits_from(ml, scale);
+            if(!limits.usable()) return;
+            int arcdivision = 64;
+            py::object div = py::getattr(cb, "arcdivision", py::none());
+            if(!div.is_none()) {
+                long n = PyLong_AsLong(div.ptr());
+                if(n > 0) arcdivision = (int)n;
+                PyErr_Clear();
+            }
+            timer_.reset(new CallbackTimer(limits, arcdivision));
+        });
+    }
+
+    std::unique_ptr<CallbackTimer> timer_;
     bool has_program_stop_ = false;
     bool has_optional_program_stop_ = false;
     bool has_program_end_ = false;
@@ -896,6 +1157,24 @@ void SET_FEED_MODE(int /*spindle*/, int mode) {
     parse_state.canon->set_feed_mode(mode);
 }
 
+// Ask the canon `method()` for None or nine numbers. True with `out` filled
+// for nine; false for None, or after a failure (left on the interp_error
+// protocol, so the parse ends with it).
+static bool optional_nine(const char *method, Point9 &out) {
+    bool answered = false;
+    canon_guard([&]{
+        py::object r = py::handle(parse_state.callback).attr(method)();
+        if(r.is_none()) return;
+        if(!PySequence_Check(r.ptr()) || PySequence_Size(r.ptr()) != 9)
+            throw py::type_error(std::string(method)
+                                 + ": expected None or nine numbers");
+        py::sequence seq = py::reinterpret_borrow<py::sequence>(r);
+        for(size_t i = 0; i < 9; i++) out[i] = py::cast<double>(seq[i]);
+        answered = true;
+    });
+    return answered && !parse_state.interp_error;
+}
+
 // Where task's canon would send the machine before this M6
 // (CHANGE_TOOL in emccanon.cc): the canon's get_tool_change_position() -
 // the iocontrol tool-change-pos-* pins of a simulator - when it answers nine
@@ -905,20 +1184,8 @@ static bool tool_change_target(Point9 &target) {
     Point9 given = {};
     int n = 0;
     if(parse_state.has_get_tool_change_position) {
-        bool answered = false;
-        canon_guard([&]{
-            py::object r = py::handle(parse_state.callback)
-                    .attr("get_tool_change_position")();
-            if(r.is_none()) return;
-            if(!PySequence_Check(r.ptr()) || PySequence_Size(r.ptr()) != 9)
-                throw py::type_error("get_tool_change_position: expected "
-                                     "None or nine numbers");
-            py::sequence seq = py::reinterpret_borrow<py::sequence>(r);
-            for(size_t i = 0; i < 9; i++) given[i] = py::cast<double>(seq[i]);
-            answered = true;
-        });
+        if(optional_nine("get_tool_change_position", given)) n = 9;
         if(parse_state.interp_error) return false;
-        if(answered) n = 9;
     }
     if(!n) {
         n = parse_state.ini_tool_change_n;
@@ -949,6 +1216,75 @@ static void private_table_change_tool(int toolno) {
             return;
     }
     tooldata_load_spindle(idx, random);
+}
+
+// The machine as it stands at cycle start, from a simulator canon - what
+// task's synch would hand a real interpreter. In two halves around the
+// interpreter's init(): the tool in the spindle and the tool offset first,
+// since init() loads the tool table; the position after, since turning a
+// machine position into program coordinates needs the work offsets init()
+// sends.
+static void machine_state_before_init() {
+    // The tool in the spindle, as an M61 Q<n> leaves the private table
+    // (emcToolSetNumber): its entry loaded into the spindle slot.
+    if(parse_state.has_get_tool_in_spindle && parse_state.private_tool_table) {
+        canon_guard([&]{
+            py::object r = py::handle(parse_state.callback)
+                    .attr("get_tool_in_spindle")();
+            if(r.is_none()) return;
+            int toolno = py::cast<int>(r);
+            if(toolno == 0) {
+                CANON_TOOL_TABLE empty = tooldata_entry_init();
+                empty.toolno = 0;
+                empty.pocketno = 0;
+                tooldata_put(empty, 0);
+                return;
+            }
+            int idx = tooldata_find_index_for_tool(toolno);
+            if(idx < 0)
+                throw py::value_error("get_tool_in_spindle: tool "
+                        + std::to_string(toolno) + " is not in the tool table");
+            if(idx > 0)
+                tooldata_load_spindle(idx, tool_mmap_is_random_toolchanger());
+        });
+    }
+    // The tool offset in effect (stat.tool_offset), machine units; None is
+    // none, as after G49.
+    if(parse_state.has_get_tool_offset) {
+        Point9 offset = {};
+        if(optional_nine("get_tool_offset", offset))
+            parse_state.tool = machine_units_to_inch(offset);
+        else if(!parse_state.interp_error)
+            parse_state.tool = {};
+    }
+}
+
+static void machine_state_after_init() {
+    Interp *interp = dynamic_cast<Interp *>(parse_state.pinterp);
+    // init() zeroes its tool offset; give it the one in effect, in its
+    // units (inches until the program says otherwise)
+    if(parse_state.has_get_tool_offset && interp) {
+        Point9 t = from_inch(parse_state.tool);
+        EmcPose &o = interp->_setup.tool_offset;
+        o.tran.x = t[P9_X]; o.tran.y = t[P9_Y]; o.tran.z = t[P9_Z];
+        o.a = t[P9_A]; o.b = t[P9_B]; o.c = t[P9_C];
+        o.u = t[P9_U]; o.v = t[P9_V]; o.w = t[P9_W];
+    }
+    // The machine position: the interpreter starts there, and the canon is
+    // told where that is in the straight_traverse frame.
+    if(parse_state.has_get_initial_position) {
+        Point9 machine;
+        if(!optional_nine("get_initial_position", machine)) return;
+        machine = machine_units_to_inch(machine);
+        Point9 p = to_program(machine);
+        parse_state.pos = from_inch(p);
+        if(interp) interp->refresh_actual_position(&interp->_setup);
+        parse_state.have_point = true;
+        parse_state.point = p;
+        parse_state.machine = machine;
+        parse_state.position_dirty = false;
+        parse_state.canon->set_position(p);
+    }
 }
 
 void CHANGE_TOOL() {
@@ -1389,6 +1725,11 @@ static py::object parse_file(const char *f, py::handle canon,
     parse_state.has_get_tool_change_position =
             canon_defines(canon, "get_tool_change_position");
     parse_state.has_source_line = canon_defines(canon, "source_line");
+    parse_state.has_get_initial_position =
+            canon_defines(canon, "get_initial_position");
+    parse_state.has_get_tool_in_spindle =
+            canon_defines(canon, "get_tool_in_spindle");
+    parse_state.has_get_tool_offset = canon_defines(canon, "get_tool_offset");
     {
         auto renderer = GCodeRenderer::make(parse_state.callback);
         if(!renderer && PyErr_Occurred()) throw py::error_already_set();
@@ -1457,7 +1798,9 @@ static py::object parse_file(const char *f, py::handle canon,
 
     parse_state.pos = {};
 
+    machine_state_before_init();
     parse_state.pinterp->init();
+    machine_state_after_init();
     parse_state.pinterp->open(f);
 
     maybe_new_line();

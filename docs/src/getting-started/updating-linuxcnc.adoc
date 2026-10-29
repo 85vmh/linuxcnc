@@ -394,7 +394,24 @@ the same calls as before:
   absolute path of the file the line is in (the main program, a subroutine's
   or a remap's `.ngc`) and the call depth, 0 in the main program. For such a
   canon, a line of a subroutine gets its `next_line` even when it has the
-  number of the caller's line.
+  number of the caller's line. The line carrying a remapped code is its own
+  line, not 0, for every canon.
+* The machine's state at cycle start, asked once at the start of the parse:
+  `get_initial_position()` (None or nine machine coordinates in machine
+  units: the interpreter starts there, and `set_position` reports it before
+  the program's first event), `get_tool_in_spindle()` (None or a T number, 0
+  for empty: the private table's spindle slot, as an M61 Q would leave it)
+  and `get_tool_offset()` (None for no offset, as after G49, or nine machine
+  unit offsets, as `stat.tool_offset` reports them).
+* A time per move: a canon defining both `machine_limits()` (returning an
+  `rs274.program_time.MachineLimits`) and `set_move_times(seq)` gets, at the
+  end of the parse, the cumulative seconds at the end of each timed event it
+  was handed, in order - one each for `straight_traverse`, `straight_feed`,
+  `arc_feed`, `straight_probe`, `tool_change_move`, `dwell` and
+  `change_tool`, two for `rigid_tap` (in, and back out) - estimated exactly
+  as a `gcode.TimeEstimateCanon` preview is, so the last entry is its total.
+  `set_time_flags(flags)` lists what the estimate could not model, when
+  anything. Stops and M66 waits take no time in the estimate.
 
 With no LinuxCNC running there is no tool table, and a T word is an
 interpreter error ("tool not found"). `gcode.load_tool_table(path,
