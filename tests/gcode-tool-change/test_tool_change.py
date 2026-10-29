@@ -444,6 +444,272 @@ def test_renderer():
           got["notcp.ini"])
 
 
+# --- which line a remapped code's work belongs to -------------------------
+
+def located(calls, main):
+    """(file, line, call_level, call) for every call but next_line and
+    source_line, by the source_line before it; the main file as "main"."""
+    where, out = None, []
+    for c in calls:
+        if c[0] == "source_line":
+            where = ("main" if c[1] == main else os.path.basename(c[1]),
+                     c[2], c[3])
+        elif c[0] != "next_line":
+            out.append(where + (c,))
+    return out
+
+
+def test_remap_lines():
+    program = ["G21 G90 G49", "G0 X5 Y0 Z5"] \
+        + ["(filler %d)" % n for n in range(3, 5)] \
+        + ["M1 P2 (on 5)",                         # 5  M1 remap, argspec=p
+           "G88.6 X3 Z4 (on 6)",                   # 6  a G-code remap
+           "(filler 7)", "(filler 8)",
+           "o<osub> call"]                         # 9  an O-word call
+    program += ["(filler %d)" % n for n in range(10, 17)]
+    program += ["N170 M6 T2 (on 17)",              # 17 M6 remap, an N word
+                "G0 X1 (on 18)", "M2"]
+    canon = SimCanon()
+    result, main = parse(program, canon, "lines.ini")
+    parsed("remapped lines", result)
+    ev = located(canon.calls, main)
+
+    def where(name, *args):
+        return [e[:3] for e in ev if e[3][0] == name
+                and (not args or e[3][1:] == args)]
+
+    check("no line of the main program is reported as 0 after it starts",
+          not [e for e in ev if e[0] == "main" and e[1] == 0
+               and e[3][0] not in ("set_g5x_offset", "set_g92_offset",
+                                   "set_xy_rotation", "set_feed_rate",
+                                   "set_plane", "comment", "tool_offset")],
+          [e for e in ev if e[0] == "main" and e[1] == 0])
+    # (the O-word line's comment is not executed: the interpreter does not
+    # run comments on O-word lines)
+    for line in (5, 6, 17, 18):
+        check("the comment on line %d is delivered on line %d" % (line, line),
+              where("comment", "on %d" % line) == [("main", line, 0)],
+              where("comment", "on %d" % line))
+    check("M1 remap: its optional_program_stop is the sub's, call level 1",
+          where("optional_program_stop") == [("m1_remap.ngc", 2, 1)],
+          where("optional_program_stop"))
+    feeds = [w for w in where("straight_feed") if w[0] == "g886.ngc"]
+    check("G88.6 remap: its move is the sub's line 2, call level 1",
+          feeds == [("g886.ngc", 2, 1)], where("straight_feed"))
+    check("O-word call: the sub's move on its line 2, call level 1",
+          ("osub.ngc", 2, 1) in where("straight_traverse"),
+          where("straight_traverse"))
+    check("M6 remap: the tool change in the sub, after line 17",
+          where("tool_change_move") == [("m6_remap.ngc", 2, 1)]
+          and where("change_tool") == [("m6_remap.ngc", 2, 1)],
+          (where("tool_change_move"), where("change_tool")))
+    lines = [c[2] for c in canon.calls if c[0] == "source_line"
+             and c[1] == main]
+    check("next_line/source_line for 17 comes before the remap's lines",
+          17 in lines and lines.index(17) < lines.index(18), lines)
+
+
+# --- the machine's state at cycle start ------------------------------------
+
+class StartCanon(SimCanon):
+    position = (20.0, 0.0, 30.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    spindle = 1
+    offset = (0.5, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+
+    def get_initial_position(self): return self.position
+    def get_tool_in_spindle(self): return self.spindle
+    def get_tool_offset(self): return self.offset
+
+
+def test_initial_state():
+    program = ["G21 G90",
+               "(DEBUG,#5420 #5421 #5422 #<_current_tool> #5400 #5403)",
+               "G91 G0 X1", "G90 G43 H2", "G0 X2", "M2"]
+    canon = StartCanon()
+    result, _ = parse(program, canon, "notcp.ini")
+    parsed("initial state", result)
+    c = canon.calls
+    first = [x for x in c if x[0] not in ("next_line", "source_line",
+                                          "set_g5x_offset", "set_g92_offset",
+                                          "set_xy_rotation")]
+    check("set_position for the initial position before any other event, "
+          "with T1's offset in effect",
+          first and first[0][0] == "set_position"
+          and near(first[0][1:], (19.5, 0, 29)), first[:2])
+    msg = [float(v) for v in events(c, "message")[0][1][0].split()]
+    check("#5420-#5422 are the start, T1 is #<_current_tool> and #5400, "
+          "#5403 its Z offset", msg == [19.5, 0, 29, 1, 1, 1], msg)
+    trav = events(c, "straight_traverse")
+    check("G91 G0 X1 moves 1 from the initial position",
+          trav and near(trav[0][1], (20.5, 0, 29)), trav)
+    sets = events(c, "set_position")
+    # the machine is at X21 after the G91 move under T1
+    check("G43 H2 from the initial tool offset: set_position at T2's tip",
+          len(sets) == 2 and near(sets[1][1], (21.25, -0.75, 28)), sets)
+
+    canon = StartCanon()
+    canon.spindle, canon.offset = 0, None
+    result, _ = parse(["G21", "(DEBUG,#5400 #5420 #5422)", "M2"], canon,
+                      "notcp.ini")
+    parsed("empty spindle, no offset", result)
+    msg = [float(v) for v in events(canon.calls, "message")[0][1][0].split()]
+    check("get_tool_in_spindle 0 empties the spindle, get_tool_offset None "
+          "is no offset", msg == [0, 20, 30], msg)
+
+
+
+def test_initial_state_unknown_tool():
+    canon = StartCanon()
+    canon.spindle = 7
+    try:
+        parse(["M2"], canon, "notcp.ini")
+    except Exception as e:
+        check("get_tool_in_spindle with a tool not in the table: an error "
+              "naming it", "7" in str(e) or "parse_file" in str(e), repr(e))
+    else:
+        check("get_tool_in_spindle with a tool not in the table: an error",
+              False, "no exception")
+
+
+def test_initial_state_none():
+    """get_initial_position and get_tool_in_spindle answering None: the same
+    calls as without them. (get_tool_offset None is no offset, as after G49,
+    checked above.)"""
+    class Nones(SimCanon):
+        def get_initial_position(self): return None
+        def get_tool_in_spindle(self): return None
+    traces = []
+    for cls in (Nones, SimCanon):
+        canon = cls()
+        _, main = parse(TWO_CHANGES, canon, "tcp.ini")
+        # each parse has its own temporary program file
+        traces.append([("source_line", "main") + c[2:]
+                       if c[0] == "source_line" and c[1] == main else c
+                       for c in canon.calls])
+    check("get_initial_position/get_tool_in_spindle None: as without them",
+          traces[0] == traces[1])
+
+
+# --- per-move times --------------------------------------------------------
+
+def _limits(tool_change_seconds=7.0, **kw):
+    from rs274.program_time import MachineLimits
+    return MachineLimits(**kw, tool_change_seconds=tool_change_seconds)
+
+
+class TimedCanon(SimCanon):
+    limits = None
+    times = flags = None
+
+    def machine_limits(self): return self.limits
+    def set_move_times(self, seq): self.times = list(seq)
+    def set_time_flags(self, flags): self.flags = list(flags)
+
+
+# No acceleration limit, so each move takes its length over its speed, and
+# 10 mm/s on every linear axis. Every line's time worked by hand.
+HAND_TIMED = [
+    "G21 G90 G94 G49 G18",
+    "G0 X0 Y0 Z0",                  # the start: not timed            0
+    "G0 X50",                       # 50 mm at MAX_VELOCITY 10        5
+    "G1 X60 F60",                   # 10 mm at 1 mm/s                15
+    "S600 M3",
+    "G95 G1 X70 F0.5",              # 0.5 mm/rev * 600 = 5 mm/s      17
+    "G96 D100 S100",                # CSS clamped to D: 100 rpm
+    "G1 X35",                       # 35 mm at 0.5*100/60 mm/s       59
+    "G97 S600",
+    "G33 Z-10 K0.5",                # 10 mm at 0.5*600/60 = 5 mm/s   61
+    "G33.1 Z-15 K0.5 I2",           # in 5 mm at 5 mm/s              62
+                                    # out at 10 mm/s (I2, capped)    62.5
+    "G4 P3",                        # 3 s                            65.5
+    "T1 M6",                        # TOOL_CHANGE_SECONDS 7          72.5
+    "M2",
+]
+HAND_TIMES = [0, 5, 15, 17, 59, 61, 62, 62.5, 65.5, 72.5]
+HAND_EVENTS = ["straight_traverse", "straight_traverse", "straight_feed",
+               "straight_feed", "straight_feed", "straight_feed",
+               "rigid_tap", "dwell", "change_tool"]
+TIMED = {"straight_traverse", "straight_feed", "arc_feed", "straight_probe",
+         "tool_change_move", "rigid_tap", "dwell", "change_tool"}
+
+
+def renderer_total(program, limits, ini, tools=None):
+    """The renderer's estimate of the same program, or None without GL."""
+    try:
+        sys.path.insert(0, os.path.join(HERE, "..", "gcode-renderer"))
+        import canon as harness
+    except ImportError:
+        return None
+    if harness.gcode is None:
+        return None
+
+    class Headless(harness.HeadlessCanon):
+        TOOLS = tools or {}
+    os.environ["INI_FILE_NAME"] = os.path.join(HERE, ini)
+    try:
+        c = harness.parse("\n".join(program) + "\n", limits=limits,
+                          cls=Headless)
+    finally:
+        os.environ.pop("INI_FILE_NAME", None)
+    return c.program_time.total
+
+
+def test_move_times():
+    canon = TimedCanon()
+    canon.limits = _limits(vmax=(10,) * 3 + (0,) * 3 + (10,) * 3,
+                           amax=(0,) * 9)
+    result, _ = parse(HAND_TIMED, canon, "notcp.ini")
+    parsed("hand-timed program", result)
+    timed = [x[0] for x in canon.calls if x[0] in TIMED]
+    check("the timed events, rigid_tap twice", timed == HAND_EVENTS, timed)
+    check("one entry per timed event, each the hand-worked time",
+          canon.times is not None and len(canon.times) == len(HAND_TIMES)
+          and all(abs(a - b) < 1e-9 for a, b in zip(canon.times, HAND_TIMES)),
+          canon.times)
+    check("no flags for a program the estimate models", canon.flags is None,
+          canon.flags)
+    total = renderer_total(HAND_TIMED, canon.limits, "notcp.ini")
+    if total is None:
+        print("skip renderer comparison: no rs274.glcanon")
+    else:
+        check("the last entry is the renderer's total",
+              abs(canon.times[-1] - total) < 1e-9, (canon.times[-1], total))
+
+    # Acceleration, look-ahead, rotation, arcs, a hidden span, a probe, an
+    # unbounded CSS, a tool offset: the renderer's total, and its flags.
+    program = ["G21 G90 G94 G49 G17", "G0 X0 Y0 Z0",
+               "G10 L2 P1 X3 Y4 R30", "G54", "G1 X10 F600", "G2 X20 Y0 R8",
+               "G3 X30 Y0 I5 J0", "G1 Y20 Z-3", "(AXIS,hide)", "G1 X0",
+               "(AXIS,show)", "G0 X40 Y40", "G38.2 Z-10 F100", "S1000 M3",
+               "G96 S50 G95 G1 X5 F0.1", "G97", "G94 F300", "G43 H1",
+               "G1 X0 Y0", "M2"]
+    canon = TimedCanon()
+    canon.limits = _limits(4.0, vmax=(20, 15, 10, 0, 0, 0, 0, 0, 0),
+                           amax=(200, 150, 100, 0, 0, 0, 0, 0, 0),
+                           traj_vmax=18, traj_amax=180)
+    result, _ = parse(program, canon, "notcp.ini")
+    parsed("accelerated program", result)
+    timed = [x for x in canon.calls if x[0] in TIMED]
+    check("accelerated: one entry per timed event, never decreasing",
+          canon.times and len(canon.times) == len(timed)
+          and all(b >= a for a, b in zip(canon.times, canon.times[1:])),
+          canon.times)
+    check("accelerated: the estimator's flags",
+          canon.flags == ["css-unbounded", "probe-full-length"], canon.flags)
+    # the renderer reads T1 from its canon's get_tool, the same table row
+    t1 = (1, 0.5, 0.0, 1.0) + (0.0,) * 6 + (0.4, 0.0, 0.0, 0)
+    total = renderer_total(program, canon.limits, "notcp.ini", {1: t1})
+    if total is not None:
+        check("accelerated: the last entry is the renderer's total",
+              abs(canon.times[-1] - total) < 1e-9, (canon.times[-1], total))
+
+    # a canon without set_move_times is not timed and not asked
+    class NoSink(SimCanon):
+        def machine_limits(self): raise AssertionError("asked")
+    result, _ = parse(HAND_TIMED, NoSink(), "notcp.ini")
+    parsed("machine_limits without set_move_times: untimed", result)
+
+
 def main():
     # before any table: this process has none to fall back on
     test_missing_get_tool()
@@ -457,6 +723,11 @@ def main():
     test_work_offsets()
     test_legacy_canon()
     test_renderer()
+    test_remap_lines()
+    test_initial_state()
+    test_initial_state_unknown_tool()
+    test_initial_state_none()
+    test_move_times()
 
     if FAILURES:
         print("%d check(s) failed" % len(FAILURES))
