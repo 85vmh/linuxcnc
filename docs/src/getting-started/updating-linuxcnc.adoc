@@ -373,6 +373,11 @@ the same calls as before:
   without D. `set_feed_mode(per_rev)`: 1 under G95, else 0.
   `set_spindle_sync(units_per_rev)`: the G33/G33.1/G76 pitch in inches, 0 when
   it ends.
+  `set_spindle_sync_angle(degrees)`: right before each `set_spindle_sync`
+  that starts or changes a synch (not the 0 that ends it), the angle past the
+  spindle index the synch starts at, as the interpreter passes it: the D word
+  of a G33 (as its magnitude) or of a G76, else 0. A G76 passes its D on the
+  entry taper and the thread pass, and 0 on the exit taper.
 * M66 asks `get_digital_input(index, default)`, `get_analog_input(index,
   default)` and `wait(index, input_type, wait_type, timeout)`; the answer goes
   through `int()`/`float()` into `#5399`. Without them the interpreter keeps

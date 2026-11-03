@@ -96,6 +96,7 @@ class SimCanon(BaseCanon):
 SIM_EVENTS = {"program_stop", "optional_program_stop", "program_end",
               "spindle_on", "spindle_off", "set_spindle_speed",
               "set_spindle_mode", "set_feed_mode", "set_spindle_sync",
+              "set_spindle_sync_angle",
               "get_digital_input", "get_analog_input", "wait"}
 
 
@@ -263,6 +264,52 @@ def test_spindle_and_feed():
           1 in modes and 0 in modes[modes.index(1):], modes)
 
 
+# --- the angle past the index a synch starts at --------------------------
+
+THREAD_PROGRAM = """G21 G18 G90 G94
+M3 S500
+G0 X10 Z2
+G33 Z-10 K1.5 D90
+G0 X10 Z2
+G76 P1.5 Z-10 I-1 J0.5 K1 E1 L3 D45
+M2
+"""
+
+
+class AngleCanon(SimCanon):
+    def set_spindle_sync_angle(self, a): self.record("set_spindle_sync_angle", a)
+
+
+def test_spindle_sync_angle():
+    canon = AngleCanon()
+    result, _ = parse(THREAD_PROGRAM, canon)
+    check("thread program parses", ok_result(result), gcode.strerror(result))
+    c = canon.calls
+    sync = [(i, x) for i, x in enumerate(c) if x[0] == "set_spindle_sync"]
+    starts = [(i, x) for i, x in sync if x[1] != 0.0]
+    check("every synch start comes right after its set_spindle_sync_angle",
+          starts and all(c[i - 1][0] == "set_spindle_sync_angle" for i, _ in starts),
+          [c[i - 1:i + 1] for i, _ in starts])
+    check("... and no synch end does",
+          all(c[i - 1][0] != "set_spindle_sync_angle" for i, x in sync if x[1] == 0.0))
+    g33 = [(c[i - 1][1], x[1]) for i, x in starts if line_of(c, i) == 4]
+    check("G33 Z-10 K1.5 D90: set_spindle_sync_angle(90), set_spindle_sync(1.5/25.4)",
+          len(g33) == 1 and g33[0][0] == 90.0 and abs(g33[0][1] - 1.5 / 25.4) < 1e-12, g33)
+    g76 = [(c[i - 1][1], x[1]) for i, x in starts if line_of(c, i) == 6]
+    pitch = 1.5 / 25.4
+    passes = [g76[k:k + 3] for k in range(0, len(g76), 3)]
+    check("G76 L3 D45: per pass the entry taper and the thread at 45, the exit "
+          "taper at 0, as the interpreter passes them",
+          passes and len(g76) % 3 == 0
+          and all(p[0][0] == 45.0 and p[1] == (45.0, p[1][1]) and abs(p[1][1] - pitch) < 1e-12
+                  and p[2][0] == 0.0 for p in passes), g76)
+
+    plain = SimCanon()
+    parse(THREAD_PROGRAM, plain)
+    check("a canon without set_spindle_sync_angle gets the same calls, less the angles",
+          plain.calls == [x for x in c if x[0] != "set_spindle_sync_angle"])
+
+
 # --- a canon without the new methods: the sequence it has always had ------
 
 # Programs a canon written before the simulator callbacks could parse: no T
@@ -387,6 +434,7 @@ def main():
     test_m66_in_remap()
     test_wait_and_analog()
     test_spindle_and_feed()
+    test_spindle_sync_angle()
     test_callback_exception_ends_parse()
 
     if FAILURES:

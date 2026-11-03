@@ -597,6 +597,7 @@ public:
         has_set_spindle_mode_ = canon_defines(cb, "set_spindle_mode");
         has_set_feed_mode_ = canon_defines(cb, "set_feed_mode");
         has_set_spindle_sync_ = canon_defines(cb, "set_spindle_sync");
+        has_set_spindle_sync_angle_ = canon_defines(cb, "set_spindle_sync_angle");
         has_get_digital_input_ = canon_defines(cb, "get_digital_input");
         has_get_analog_input_ = canon_defines(cb, "get_analog_input");
         has_wait_ = canon_defines(cb, "wait");
@@ -755,6 +756,11 @@ public:
         maybe_new_line();
         forward("set_spindle_sync", units_per_rev);
     }
+    void set_spindle_sync_angle(double degrees) override {
+        if(!has_set_spindle_sync_angle_) return;
+        maybe_new_line();
+        forward("set_spindle_sync_angle", degrees);
+    }
     // The answers go through int() and float(), as a Python caller would
     // convert them; a failed call or conversion ends the parse like any
     // other callback, and the interpreter gets the default meanwhile.
@@ -855,6 +861,7 @@ private:
     bool has_set_spindle_mode_ = false;
     bool has_set_feed_mode_ = false;
     bool has_set_spindle_sync_ = false;
+    bool has_set_spindle_sync_angle_ = false;
     bool has_get_digital_input_ = false;
     bool has_get_analog_input_ = false;
     bool has_wait_ = false;
@@ -1362,8 +1369,10 @@ void SET_CUTTER_RADIUS_COMPENSATION(double /*radius*/) {}
 void START_CUTTER_RADIUS_COMPENSATION(int /*direction*/) {}
 void STOP_CUTTER_RADIUS_COMPENSATION(int /*direction*/) {}
 void START_SPEED_FEED_SYNCH() {}
-// G33/G33.1/G76 pitch: inches advanced per spindle revolution.
-void START_SPEED_FEED_SYNCH(int /*spindle*/, double sync, bool /*vel*/, double /*angle*/) {
+// G33/G33.1/G76 pitch: inches advanced per spindle revolution, after the
+// angle past the index the synch starts at, in degrees.
+void START_SPEED_FEED_SYNCH(int /*spindle*/, double sync, bool /*vel*/, double angle) {
+    parse_state.canon->set_spindle_sync_angle(angle);
     parse_state.canon->set_spindle_sync(ensure_inch(sync));
 }
 void STOP_SPEED_FEED_SYNCH() {

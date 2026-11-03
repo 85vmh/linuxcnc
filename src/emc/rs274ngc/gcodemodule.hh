@@ -198,6 +198,11 @@ public:
     virtual void set_feed_mode(int /*per_rev*/) {}
     virtual void set_spindle_mode(double /*css_max*/) {}
     virtual void set_spindle_sync(double /*units_per_rev*/) {}
+    // The D word of a G33 or a G76 in degrees past the index, as the
+    // interpreter passes it, just before each set_spindle_sync that starts
+    // or changes a synch. Only the callback protocol forwards it, and only
+    // to a canon that has `set_spindle_sync_angle`.
+    virtual void set_spindle_sync_angle(double /*degrees*/) {}
 
     // Events a program simulator needs and a preview does not. Only the
     // callback protocol listens, and only to a canon that has the method:
